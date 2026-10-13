@@ -283,6 +283,7 @@ $authed = !empty($_SESSION['xs_auth']) && !empty($_SESSION['xs_user_id']) && !em
 // request — so a session that's simply been open since before the expiry date gets signed
 // out the moment it crosses it, not just at the next login.
 if ($authed && !empty($_SESSION['xs_expires_at']) && strtotime($_SESSION['xs_expires_at']) <= time()) {
+    xs_db_expire_user((int) $_SESSION['xs_user_id']);
     $_SESSION = [];
     $_SESSION['flash'] = ['error', 'Your account has expired. Contact your admin.'];
     session_regenerate_id(true);
@@ -346,7 +347,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($action === 'login') {
                 $username = xs_text($_POST['username'] ?? '', 80);
                 $user = $username !== '' ? xs_db_find_user_by_username($username) : null;
-                if ($user && $user['status'] === 'active' && password_verify((string) ($_POST['password'] ?? ''), $user['password_hash'])) {
+                if ($user && $user['status'] === 'active' && $user['payment_status'] !== 'pending' && password_verify((string) ($_POST['password'] ?? ''), $user['password_hash'])) {
                     // This panel is for 'admin' accounts only — a 'user' account (created for the
                     // NexShow device/client login) must use that screen instead, never this one.
                     if ($user['role'] !== 'admin') {
@@ -354,6 +355,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         xs_redirect('', 'This is a user account — sign in from the NexShow device screen instead.', 'error');
                     }
                     if (xs_user_is_expired($user)) {
+                        xs_db_expire_user((int) $user['id']);
                         xs_redirect('', 'That account has expired. Contact your admin.', 'error');
                     }
                     session_regenerate_id(true);
@@ -519,7 +521,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($username === '') xs_redirect('view=settings', 'Choose a username.', 'error');
                 if (strlen($pw) < 8) xs_redirect('view=settings', 'Use at least 8 characters.', 'error');
                 xs_db_create_user($companyId, $username, password_hash($pw, PASSWORD_DEFAULT), $role);
-                xs_redirect('view=settings', 'User added.');
+                xs_redirect('view=settings&activate=' . rawurlencode($username), 'User added. Make a payment to activate it.');
                 break;
 
             case 'toggle_user':
@@ -528,9 +530,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $targetId = (int) ($_POST['userId'] ?? 0);
                 if ($targetId === (int) $_SESSION['xs_user_id']) xs_redirect('view=settings', "You can't deactivate your own account.", 'error');
                 $status = ($_POST['status'] ?? '') === 'active' ? 'active' : 'inactive';
+                $target = xs_db_find_company_user($companyId, $targetId);
+                // Only a user whose fee is actually marked 'paid' can be switched back on from
+                // here — 'pending' (awaiting confirmation) or 'none' (never paid, or expired and
+                // reset back to needing a fresh payment) both require going through the payment
+                // flow again instead; only Ab Studio Digital can mark that 'paid' directly in
+                // the database.
+                if ($status === 'active' && $target && $target['payment_status'] !== 'paid') {
+                    xs_redirect('view=settings', 'This user needs a payment before it can be activated.', 'error');
+                }
                 if ($status === 'inactive' && xs_db_count_active_admins($companyId) <= 1) {
-                    $targetUser = array_values(array_filter(xs_db_list_company_users($companyId), function ($u) use ($targetId) { return (int) $u['id'] === $targetId; }));
-                    if ($targetUser && $targetUser[0]['role'] === 'admin') {
+                    if ($target && $target['role'] === 'admin') {
                         xs_redirect('view=settings', "Can't deactivate the only admin — promote someone else first.", 'error');
                     }
                 }
@@ -772,10 +782,14 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
 .brand { font-family: var(--font-display); font-size: 1.9rem; text-decoration: none; letter-spacing: -0.01em; }
 .brand::first-letter { color: var(--accent); font-size: 1.25em; }
 .brand small { font-family: var(--font-ui); font-size: 0.75rem; color: var(--accent); margin-left: 0.4rem; letter-spacing: 0.04em; }
-.nav { display: flex; gap: 0.25rem; margin-right: auto; }
-.nav a { padding: 0.45rem 0.8rem; border-radius: 8px; color: var(--muted); text-decoration: none; }
-.nav a:hover { color: var(--text); background: var(--panel); }
-.nav a[aria-current] { color: var(--text); background: var(--panel-2); }
+.nav { display: flex; gap: 0.6rem; margin-right: auto; }
+.nav a {
+  padding: 0.7rem 1.5rem; border: 1px solid var(--line-2); border-radius: 10px;
+  color: var(--muted); font-size: 1rem; font-weight: 500; text-decoration: none;
+  transition: background-color .2s, border-color .2s, color .2s;
+}
+.nav a:hover { color: var(--text); background: var(--panel); border-color: rgba(255, 255, 255, 0.26); }
+.nav a[aria-current] { color: var(--text); background: var(--panel-2); border-color: var(--line-2); }
 .top__right { display: flex; align-items: center; gap: 0.5rem; }
 .top form { margin: 0; }
 
@@ -801,6 +815,8 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
 .btn--ghost:hover { background: var(--panel-2); color: var(--text); border-color: transparent; }
 .btn--danger { color: var(--danger); }
 .btn--danger:hover { background: rgba(232, 128, 111, 0.12); border-color: rgba(232, 128, 111, 0.4); }
+.btn--success { background: #22a855; border-color: #22a855; color: #fff; font-weight: 600; }
+.btn--success:hover { background: #1c8f47; border-color: #1c8f47; }
 .theme-field { display: flex; align-items: center; gap: 0.5rem; }
 .theme-field__label { font-size: 0.8125rem; color: var(--muted); white-space: nowrap; }
 .theme-switch {
@@ -1036,6 +1052,19 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
 .lib__item span { font-size: 0.75rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lib__empty { padding: 2rem; text-align: center; color: var(--muted); }
 
+/* ---------- Pay-to-activate modal ---------- */
+#payModal { width: min(420px, calc(100vw - 32px)); max-height: min(90vh, 640px); padding: 2rem 1.75rem; text-align: center; overflow-y: auto; }
+#payModal h2 { margin: 0 0 0.5rem; font-family: var(--font-display); font-size: 1.4rem; }
+#payModal p { color: var(--muted); margin: 0 0 1rem; }
+#payModal .field { text-align: left; }
+.pay__icon { width: 56px; height: 56px; margin: 0 auto 1rem; display: grid; place-items: center; border-radius: 50%; background: rgba(255, 45, 143, 0.12); font-size: 1.6rem; }
+.pay__actions { display: grid; gap: 0.6rem; margin-top: 1rem; }
+.pay__actions .btn { width: 100%; }
+.pay__qr { display: flex; justify-content: center; margin-bottom: 0.75rem; }
+.pay__qr > div { width: 186px; height: 186px; background: #fff; border-radius: 10px; padding: 8px; display: flex; align-items: center; justify-content: center; }
+.pay__upi strong { color: var(--text); }
+.pay__error { color: #ff6b6b; font-size: 0.8125rem; margin: -0.5rem 0 0.75rem; }
+
 /* ---------- Auth ---------- */
 .auth { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; background: var(--auth-grad); }
 .auth__card { width: min(400px, 100%); text-align: center; }
@@ -1055,7 +1084,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
   .top { gap: 0.5rem; padding: 0 12px; }
   .brand { font-size: 1.3rem; }
   .brand small { display: none; }
-  .nav { gap: 0; }
+  .nav { gap: 0.4rem; }
   .nav a { padding: 0.4rem 0.5rem; font-size: 0.875rem; }
   .theme-field__label { display: none; }
   .top__right { gap: 0.35rem; }
@@ -1450,6 +1479,15 @@ document.addEventListener('DOMContentLoaded', function () {
     $companyUsers = $canManageUsers ? xs_db_list_company_users($companyId) : [];
     $company = xs_db_get_company($companyId);
     $me = xs_db_find_user_by_id((int) $_SESSION['xs_user_id']);
+    // ?activate=<username> (set by the add_user redirect) auto-opens the payment modal for that
+    // user — but only if they're genuinely still pending, so a stale/reused link can't do anything.
+    $activateUser = null;
+    $activateUsername = (string) ($_GET['activate'] ?? '');
+    if ($canManageUsers && $activateUsername !== '') {
+        foreach ($companyUsers as $u) {
+            if ($u['username'] === $activateUsername && $u['payment_status'] === 'pending') { $activateUser = $u; break; }
+        }
+    }
 ?>
   <div class="page-head">
     <div>
@@ -1462,18 +1500,28 @@ document.addEventListener('DOMContentLoaded', function () {
   <section class="panel">
     <h2>Users <small><?= e($company['name'] ?? 'your company') ?> &mdash; Add User For NexShow Client Login.</small></h2>
     <?php if ($companyUsers): ?>
-      <?php foreach ($companyUsers as $u): $isSelf = (int) $u['id'] === (int) $_SESSION['xs_user_id']; ?>
+      <?php foreach ($companyUsers as $u):
+          $isSelf = (int) $u['id'] === (int) $_SESSION['xs_user_id'];
+          // A user only ever skips the payment flow and gets the plain Reactivate toggle once
+          // its fee is actually marked 'paid' — 'pending' (awaiting confirmation) or 'none'
+          // (never paid, or expired and reset back to needing a fresh one) both route through
+          // the payment modal instead, same as a brand new user does.
+          $needsPayment = $u['status'] !== 'active' && $u['payment_status'] !== 'paid';
+          $statusLabel = $u['status'] === 'active' ? 'Active' : ($needsPayment ? ($u['payment_status'] === 'pending' ? 'Pending payment' : 'Needs payment') : 'Inactive');
+      ?>
         <div class="user-block">
           <div class="tag-row">
             <div class="field" style="flex:1">
               <span><?= e($u['username']) ?><?= $isSelf ? ' (you)' : '' ?></span>
-              <span class="hint"><?= e(ucfirst($u['role'])) ?> &middot; <?= $u['status'] === 'active' ? 'Active' : 'Inactive' ?> &middot; <?php
+              <span class="hint"><?= e(ucfirst($u['role'])) ?> &middot; <?= e($statusLabel) ?> &middot; <?php
                 if (empty($u['expires_at'])) { echo 'Never expires'; }
                 elseif (strtotime($u['expires_at']) <= time()) { echo 'Expired'; }
                 else { echo 'Expires ' . e(date('M j, Y', strtotime($u['expires_at']))); }
               ?></span>
             </div>
-            <?php if (!$isSelf): ?>
+            <?php if ($needsPayment): ?>
+              <button class="btn btn--sm btn--success" type="button" data-pay-user="<?= e($u['username']) ?>">Pay to activate</button>
+            <?php elseif (!$isSelf): ?>
             <form method="post" action="admin.php">
               <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
               <input type="hidden" name="action" value="toggle_user">
@@ -1507,6 +1555,110 @@ document.addEventListener('DOMContentLoaded', function () {
       <div style="align-self: end;"><button class="btn btn--sm btn--primary" type="submit">Add user</button></div>
     </form>
   </section>
+
+  <dialog id="payModal" aria-labelledby="pay-title">
+    <div data-pay-screen="info">
+      <div class="pay__icon">⚠️</div>
+      <h2 id="pay-title">Activate <span data-pay-username></span></h2>
+      <p>This user needs a one-time activation payment of <strong>&#8377;1,999</strong> before it can sign in.</p>
+      <div class="pay__actions">
+        <button class="btn btn--primary" type="button" data-pay-next="pay">Make Payment</button>
+        <a class="btn btn--ghost" href="https://wa.me/917385250853" target="_blank" rel="noopener">WhatsApp Support</a>
+        <button class="btn btn--ghost" type="button" data-close>Close</button>
+      </div>
+    </div>
+    <div data-pay-screen="pay" hidden>
+      <h2>Pay &#8377;1,999</h2>
+      <p>Scan the QR code or use the UPI ID below, then let us know once you've paid.</p>
+      <div class="pay__qr"><div id="payQr"></div></div>
+      <p class="pay__upi">UPI ID: <strong>7385250853@yapl</strong></p>
+      <div class="pay__actions">
+        <a class="btn btn--primary" id="payUpiBtn" href="#">Pay via UPI App</a>
+        <button class="btn btn--success" type="button" data-pay-next="confirm">I've Paid, Notify Support</button>
+      </div>
+    </div>
+    <div data-pay-screen="confirm" hidden>
+      <h2>Confirm payment</h2>
+      <p>Enter the transaction/reference ID from your payment app so we can verify it.</p>
+      <label class="field"><span>Transaction ID</span><input type="text" id="payTxnId" placeholder="e.g. 123456789012" autocomplete="off"></label>
+      <p class="pay__error" id="payTxnError" hidden>Enter your transaction ID.</p>
+      <div class="pay__actions">
+        <button class="btn btn--success" type="button" id="paySubmit">Submit &amp; Notify Support</button>
+      </div>
+    </div>
+  </dialog>
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <script>
+  (function () {
+    var dlg = document.getElementById('payModal');
+    if (!dlg) return;
+    var UPI_ID = '7385250853@yapl';
+    var PAYEE_NAME = 'AB Studio Digital';
+    var AMOUNT = 1999;
+    var WHATSAPP = '917385250853';
+    var companyName = <?= json_encode($company['name'] ?? '', JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+    var currentUsername = '';
+
+    function showScreen(name) {
+      dlg.querySelectorAll('[data-pay-screen]').forEach(function (el) {
+        el.hidden = el.dataset.payScreen !== name;
+      });
+    }
+
+    function openFor(username) {
+      currentUsername = username;
+      dlg.querySelectorAll('[data-pay-username]').forEach(function (el) { el.textContent = username; });
+      showScreen('info');
+      if (typeof dlg.showModal === 'function') dlg.showModal();
+    }
+
+    function buildUpiLink() {
+      var note = encodeURIComponent('Activate user ' + currentUsername);
+      return 'upi://pay?pa=' + UPI_ID + '&pn=' + encodeURIComponent(PAYEE_NAME) + '&am=' + AMOUNT + '&cu=INR&tn=' + note;
+    }
+
+    dlg.querySelectorAll('[data-pay-next]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var next = btn.dataset.payNext;
+        showScreen(next);
+        if (next === 'pay') {
+          var link = buildUpiLink();
+          document.getElementById('payUpiBtn').href = link;
+          var qrEl = document.getElementById('payQr');
+          qrEl.innerHTML = '';
+          if (window.QRCode) new QRCode(qrEl, { text: link, width: 170, height: 170, colorDark: '#000000', colorLight: '#ffffff' });
+        }
+      });
+    });
+
+    var txnInput = document.getElementById('payTxnId');
+    var txnError = document.getElementById('payTxnError');
+    document.getElementById('paySubmit').addEventListener('click', function () {
+      var value = txnInput.value.trim();
+      if (!value) { txnError.hidden = false; return; }
+      txnError.hidden = true;
+      var message = "Hi, I've paid to activate a user.\nCompany: " + companyName +
+        '\nUsername: ' + currentUsername + '\nAmount: ₹' + AMOUNT + '\nTransaction ID: ' + value;
+      window.open('https://wa.me/' + WHATSAPP + '?text=' + encodeURIComponent(message), '_blank');
+      dlg.close();
+      txnInput.value = '';
+    });
+    txnInput.addEventListener('input', function () { txnError.hidden = true; });
+
+    dlg.querySelectorAll('[data-close]').forEach(function (btn) {
+      btn.addEventListener('click', function () { dlg.close(); });
+    });
+    dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+
+    document.querySelectorAll('[data-pay-user]').forEach(function (btn) {
+      btn.addEventListener('click', function () { openFor(btn.dataset.payUser); });
+    });
+
+    <?php if ($activateUser): ?>
+    openFor(<?= json_encode($activateUser['username'], JSON_HEX_TAG | JSON_HEX_AMP) ?>);
+    <?php endif; ?>
+  })();
+  </script>
   <?php endif; ?>
 
   <form method="post" action="admin.php" class="panel">

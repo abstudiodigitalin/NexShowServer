@@ -25,6 +25,12 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash VARCHAR(255) NOT NULL,
   role          ENUM('admin','user') NOT NULL DEFAULT 'user',
   status        ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  payment_status ENUM('none','pending','paid') NOT NULL DEFAULT 'none', -- 'none' = not subject to
+    -- the per-user activation fee (the company's own founding admin, and anyone created before
+    -- this existed). A user added via Settings > Add user starts 'pending' (and status
+    -- 'inactive') until Ab Studio Digital confirms payment and flips it to 'paid' directly in
+    -- the database — a company's own admin can never do this themselves (see the 'toggle_user'
+    -- guard in admin.php, which refuses to reactivate a still-pending user).
   expires_at    DATETIME NULL, -- 'user' role: 1 year from creation, checked at login and on every request after. 'admin' role: NULL, never expires.
   device_session_token VARCHAR(64) NULL, -- the one NexShow.php device session allowed to be
     -- logged in as this user right now; a fresh login overwrites it, which signs out whichever

@@ -110,6 +110,7 @@ if (!isset($_GET['show']) && !isset($_GET['preview'])) {
     // is signed out the moment it crosses it (matters most for ?show=1, which can sit open
     // on a screen for a long time).
     if ($deviceAuthed && !empty($_SESSION['xs_device_expires_at']) && strtotime($_SESSION['xs_device_expires_at']) <= time()) {
+        xs_db_expire_user((int) $_SESSION['xs_device_user_id']);
         $_SESSION = [];
         $_SESSION['device_flash'] = ['error', 'That account has expired. Contact your admin.'];
         session_regenerate_id(true);
@@ -158,11 +159,12 @@ if (!isset($_GET['show']) && !isset($_GET['preview'])) {
                             sleep(1);
                             xs_device_redirect('', 'This is an admin account — sign in from the admin panel instead.', 'error');
                         }
-                        if ($user['status'] !== 'active') {
+                        if ($user['status'] !== 'active' || $user['payment_status'] === 'pending') {
                             sleep(1);
                             xs_device_redirect('', 'This account has been deactivated. Contact your admin.', 'error');
                         }
                         if (xs_user_is_expired($user)) {
+                            xs_db_expire_user((int) $user['id']);
                             xs_device_redirect('', 'That account has expired. Contact your admin.', 'error');
                         }
                         // A fresh token here, saved to this user's row, is what signs out
