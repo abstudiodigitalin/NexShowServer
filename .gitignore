@@ -1,0 +1,8 @@
+# Real database credentials — copy db-config.example.php to create this locally.
+/db-config.php
+
+# Frame images/videos uploaded at runtime through the admin panel (per-company folders and
+# auto-generated "xs-*" filenames) — user content, not source assets. Bundled demo images
+# directly in images/Frame/ (slide-*.jpg, etc.) are kept.
+/images/Frame/*/
+/images/Frame/xs-*
