@@ -201,9 +201,13 @@ function xs_table_from_post(array $p)
     return json_encode([
         'enabled' => !empty($p['tableEnabled']),
         'headerRow' => !empty($p['tableHeaderRow']),
+        'rounded' => !empty($p['tableRounded']),
         'hAlign' => xs_enum($p['tableHAlign'] ?? '', ['left', 'center', 'right'], 'center'),
         'vAlign' => xs_enum($p['tableVAlign'] ?? '', ['top', 'center', 'bottom'], 'center'),
+        'offsetX' => xs_css($p['tableOffsetX'] ?? '') ?: '0px',
+        'offsetY' => xs_css($p['tableOffsetY'] ?? '') ?: '0px',
         'width' => max(0, min(100, (int) ($p['tableWidth'] ?? 0))), // 0 = size to fit the content, like today
+        'height' => max(0, min(100, (int) ($p['tableHeight'] ?? 0))), // 0 = size to fit the content, like today
         'fontSize' => max(10, min(200, (int) ($p['tableFontSize'] ?? 16))),
         'headerFontSize' => max(10, min(200, (int) ($p['tableHeaderFontSize'] ?? $p['tableFontSize'] ?? 16))),
         'textColor' => $hex($p['tableTextColor'] ?? '', '#ffffff'),
@@ -687,6 +691,24 @@ function xs_select($name, array $options, $value)
     echo '</select>';
 }
 
+/** A swatch + hex text field that opens the custom color-picker dialog (data-color-dialog), rather
+ *  than a native <input type=color> — whose picker varies wildly by platform and, on Android in
+ *  particular, often has no way to type an exact hex/RGB value at all. */
+function xs_color_field($name, $label, $value, $fallback)
+{
+    $value = preg_match('/^#[0-9a-f]{6}$/i', (string) $value) ? $value : $fallback;
+    ?>
+    <div class="field">
+      <span><?= e($label) ?></span>
+      <div class="color-field" data-color-field>
+        <button type="button" class="color-swatch" data-color-swatch style="background:<?= e($value) ?>" aria-label="<?= e($label) ?>"></button>
+        <input type="text" class="color-field__hex" data-color-hex value="<?= e($value) ?>" spellcheck="false" autocomplete="off" placeholder="#rrggbb">
+      </div>
+      <input type="hidden" name="<?= e($name) ?>" value="<?= e($value) ?>" data-color-value>
+    </div>
+    <?php
+}
+
 function xs_image_field($name, $label, $hint, $value, $focalName, $focalValue, $allowVideo = false)
 {
     $url = xs_thumb($value);
@@ -928,6 +950,10 @@ input:hover, select:hover, textarea:hover { border-color: rgba(255, 255, 255, 0.
 .pw-toggle:hover { color: var(--text); border-color: rgba(255, 255, 255, 0.26); }
 textarea { min-height: 88px; resize: vertical; line-height: 1.5; }
 input[type=color] { width: 100%; height: 42px; padding: 4px; background: var(--bg); border: 1px solid var(--line-2); border-radius: 8px; cursor: pointer; }
+.color-field { display: flex; gap: 0.5rem; }
+.color-swatch { width: 42px; height: 42px; flex: 0 0 auto; padding: 0; border: 1px solid var(--line-2); border-radius: 8px; cursor: pointer; transition: border-color .2s, transform .15s; }
+.color-swatch:hover { border-color: var(--accent); transform: scale(1.04); }
+.color-field input[type=text] { flex: 1 1 auto; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 .check { display: flex; align-items: center; gap: 0.6rem; cursor: pointer; }
 .check input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
@@ -970,12 +996,10 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
   background: var(--panel-2); white-space: nowrap; padding: 2px 6px; text-align: center;
 }
 .table-editor__swatch-wrap { display: inline-flex; align-items: center; vertical-align: middle; gap: 2px; flex: none; }
-input.table-editor__swatch {
+button.table-editor__swatch {
   width: 24px; min-width: 24px; height: 24px; min-height: 24px; padding: 0; flex: none;
-  background: none; border: 1px solid var(--line-2); border-radius: 50%; cursor: pointer; overflow: hidden;
+  border: 1px solid var(--line-2); border-radius: 50%; cursor: pointer; overflow: hidden;
 }
-input.table-editor__swatch::-webkit-color-swatch-wrapper { padding: 0; }
-input.table-editor__swatch::-webkit-color-swatch { border: 0; border-radius: 50%; }
 .table-editor__swatch-clear {
   display: grid; place-items: center; width: 18px; height: 18px; padding: 0; flex: none;
   background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 0.8125rem; line-height: 1;
@@ -1031,6 +1055,16 @@ input.table-editor__swatch::-webkit-color-swatch { border: 0; border-radius: 50%
 .preview__bar .seg span { padding: 0.25rem 0.6rem; font-size: 0.8125rem; }
 .preview__frame { position: relative; overflow: hidden; background: #000; transition: height .3s; }
 .preview__frame iframe { position: absolute; top: 0; left: 0; border: 0; transform-origin: 0 0; background: #000; }
+.preview__table-point {
+  position: absolute; top: 0; left: 0; width: 11px; height: 11px; margin: -6px 0 0 -6px;
+  border-radius: 3px; background: #fff; border: 1px solid rgba(0, 0, 0, 0.55); z-index: 5;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7); touch-action: none; opacity: 0.85;
+}
+.preview__table-point:hover, .preview__table-point.is-dragging { opacity: 1; transform: scale(1.2); }
+.preview__table-point[data-dir="n"], .preview__table-point[data-dir="s"] { cursor: ns-resize; }
+.preview__table-point[data-dir="e"], .preview__table-point[data-dir="w"] { cursor: ew-resize; }
+.preview__table-point[data-dir="nw"], .preview__table-point[data-dir="se"] { cursor: nwse-resize; }
+.preview__table-point[data-dir="ne"], .preview__table-point[data-dir="sw"] { cursor: nesw-resize; }
 .preview__empty { display: grid; place-items: center; aspect-ratio: 16 / 10; padding: 1.5rem; text-align: center; color: var(--muted); font-size: 0.9375rem; }
 .preview__note { margin: 0; padding: 0.65rem 0.9rem; font-size: 0.8125rem; color: var(--muted); border-top: 1px solid var(--line); }
 
@@ -1064,6 +1098,38 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
 .lib__item[hidden] { display: none; }
 .lib__item span { font-size: 0.75rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lib__empty { padding: 2rem; text-align: center; color: var(--muted); }
+
+/* ---------- Color picker ---------- */
+#colorPicker { width: min(340px, calc(100vw - 32px)); padding: 1.1rem; }
+.cp__head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.9rem; }
+.cp__title { display: flex; align-items: center; gap: 0.6rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9375rem; }
+.cp__preview { width: 22px; height: 22px; border-radius: 50%; border: 1px solid var(--line-2); flex: 0 0 auto; }
+.cp__sv {
+  position: relative; width: 100%; height: 160px; border-radius: 10px; margin-bottom: 0.9rem; cursor: crosshair; touch-action: none;
+  background:
+    linear-gradient(to top, #000, transparent),
+    linear-gradient(to right, #fff, rgba(255, 255, 255, 0)),
+    hsl(calc(var(--cp-hue, 0) * 1deg), 100%, 50%);
+}
+.cp__sv-cursor {
+  position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px;
+  border-radius: 50%; border: 2px solid #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5), 0 1px 4px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+.cp__hue {
+  position: relative; width: 100%; height: 16px; border-radius: 999px; margin-bottom: 1rem; cursor: pointer; touch-action: none;
+  background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00);
+}
+.cp__hue-thumb {
+  position: absolute; top: 50%; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+  border-radius: 50%; background: #fff; border: 2px solid rgba(0, 0, 0, 0.3); box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  pointer-events: none;
+}
+.cp__row { display: flex; gap: 0.5rem; }
+.cp__row .field { flex: 1 1 0; min-width: 0; }
+.cp__row .field span { font-size: 0.75rem; }
+.cp__rgb input { text-align: center; }
+.cp__actions { margin-top: 1rem; text-align: right; }
 
 /* ---------- Pay-to-activate modal ---------- */
 #payModal { width: min(420px, calc(100vw - 32px)); max-height: min(90vh, 640px); padding: 2rem 1.75rem; text-align: center; overflow-y: auto; }
@@ -1309,14 +1375,22 @@ document.addEventListener('DOMContentLoaded', function () {
         <div class="row">
           <label class="check"><input type="checkbox" name="tableEnabled" value="1"<?= !empty($table['enabled']) ? ' checked' : '' ?>> Show a table on this frame</label>
           <label class="check"><input type="checkbox" name="tableHeaderRow" value="1"<?= !empty($table['headerRow']) ? ' checked' : '' ?>> First row is a header</label>
+          <label class="check"><input type="checkbox" name="tableRounded" value="1"<?= !empty($table['rounded']) ? ' checked' : '' ?>> Rounded corners</label>
         </div>
         <div class="row">
           <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['hAlign'] ?? 'center'); ?></div>
           <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['vAlign'] ?? 'center'); ?></div>
         </div>
         <div class="row">
-          <div class="field"><span>Table width</span>
+          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
+          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
+        </div>
+        <div class="row">
+          <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
             <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($table['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($table['width'] ?? 0) > 0 ? $table['width'] . '%' : 'Auto') ?></output></div>
+          </div>
+          <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
+            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($table['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($table['height'] ?? 0) > 0 ? $table['height'] . '%' : 'Auto') ?></output></div>
           </div>
         </div>
         <div class="row">
@@ -1326,14 +1400,14 @@ document.addEventListener('DOMContentLoaded', function () {
           <div class="field"><span>Header text size</span>
             <div class="range-row"><input type="range" name="tableHeaderFontSize" min="10" max="200" step="1" value="<?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>px</output></div>
           </div>
-          <div class="field"><span>Background opacity</span>
+          <div class="field"><span>Background opacity <em>0% is fully see-through</em></span>
             <div class="range-row"><input type="range" name="tableBgOpacity" min="0" max="1" step="0.05" value="<?= e($table['bgOpacity'] ?? 0.55) ?>" data-range><output><?= e(round(($table['bgOpacity'] ?? 0.55) * 100)) ?>%</output></div>
           </div>
         </div>
         <div class="row">
-          <label class="field"><span>Text colour</span><input type="color" name="tableTextColor" value="<?= e($table['textColor'] ?? '#ffffff') ?>"></label>
-          <label class="field"><span>Header colour</span><input type="color" name="tableHeaderColor" value="<?= e($table['headerColor'] ?? '#ff2d8f') ?>"></label>
-          <label class="field"><span>Border colour</span><input type="color" name="tableBorderColor" value="<?= e($table['borderColor'] ?? '#ffffff') ?>"></label>
+          <?php xs_color_field('tableTextColor', 'Text colour', $table['textColor'] ?? '#ffffff', '#ffffff'); ?>
+          <?php xs_color_field('tableHeaderColor', 'Header colour', $table['headerColor'] ?? '#ff2d8f', '#ff2d8f'); ?>
+          <?php xs_color_field('tableBorderColor', 'Border colour', $table['borderColor'] ?? '#ffffff', '#ffffff'); ?>
           <label class="field"><span>Border thickness <em>px</em></span><input type="number" name="tableBorderWidth" min="0" max="8" value="<?= e($table['borderWidth'] ?? 1) ?>"></label>
         </div>
         <div class="table-editor" data-table-editor>
@@ -1404,7 +1478,7 @@ document.addEventListener('DOMContentLoaded', function () {
       <section class="panel">
         <h2>Type</h2>
         <div class="row">
-          <label class="field"><span>Text colour</span><input type="color" name="textColor" value="<?= e(preg_match('/^#[0-9a-f]{6}$/i', (string) $f['textColor']) ? $f['textColor'] : '#ffffff') ?>"></label>
+          <?php xs_color_field('textColor', 'Text colour', $f['textColor'], '#ffffff'); ?>
           <label class="field"><span>Title font</span><?php xs_select('fontFamily', ['' => 'Bodoni Moda (default)', "'Instrument Sans', sans-serif" => 'Instrument Sans', "Georgia, serif" => 'Georgia'], $raw['fontFamily'] ?? ''); ?></label>
         </div>
         <div class="row">
@@ -1437,8 +1511,11 @@ document.addEventListener('DOMContentLoaded', function () {
         <?php else: ?>
           <div class="preview__frame" data-preview>
             <iframe src="NexShow.php?preview=1&amp;frame=<?= $editIdx ?>&amp;t=<?= time() ?>" title="Frame preview" loading="lazy" tabindex="-1"></iframe>
+            <?php foreach (['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'] as $dir): ?>
+              <div class="preview__table-point" data-table-point data-dir="<?= $dir ?>" title="Drag to resize the table" hidden></div>
+            <?php endforeach; ?>
           </div>
-          <p class="preview__note">Shows the last saved version.</p>
+          <p class="preview__note">Shows the last saved version. If there's a table, drag its edges to resize.</p>
         <?php endif; ?>
       </section>
 
@@ -1485,6 +1562,26 @@ document.addEventListener('DOMContentLoaded', function () {
     <?php else: ?>
       <p class="lib__empty">No images yet. Use Upload to add one.</p>
     <?php endif; ?>
+  </dialog>
+
+  <dialog id="colorPicker" aria-label="Color picker">
+    <div class="cp__head">
+      <span class="cp__title"><span class="cp__preview" data-cp-preview></span><span data-cp-title>#ffffff</span></span>
+      <button class="btn btn--sm btn--ghost" type="button" data-close>Close</button>
+    </div>
+    <div class="cp__sv" data-cp-sv><div class="cp__sv-cursor" data-cp-sv-cursor></div></div>
+    <div class="cp__hue" data-cp-hue><div class="cp__hue-thumb" data-cp-hue-thumb></div></div>
+    <div class="cp__row">
+      <label class="field"><span>Hex</span><input type="text" data-cp-hex spellcheck="false" autocomplete="off" placeholder="#rrggbb"></label>
+    </div>
+    <div class="cp__row cp__rgb">
+      <label class="field"><span>R</span><input type="number" min="0" max="255" data-cp-r></label>
+      <label class="field"><span>G</span><input type="number" min="0" max="255" data-cp-g></label>
+      <label class="field"><span>B</span><input type="number" min="0" max="255" data-cp-b></label>
+    </div>
+    <div class="cp__actions">
+      <button class="btn btn--sm" type="button" data-close>Done</button>
+    </div>
   </dialog>
 
 <?php elseif ($view === 'settings'):
@@ -1576,7 +1673,7 @@ document.addEventListener('DOMContentLoaded', function () {
       <p>This user needs a one-time activation payment of <strong>&#8377;1,999</strong> before it can sign in.</p>
       <div class="pay__actions">
         <button class="btn btn--primary" type="button" data-pay-next="pay">Make Payment</button>
-        <a class="btn btn--ghost" href="https://wa.me/917385250853" target="_blank" rel="noopener">WhatsApp Support</a>
+        <a class="btn btn--ghost" href="https://wa.me/919309250445" target="_blank" rel="noopener">WhatsApp Support</a>
         <button class="btn btn--ghost" type="button" data-close>Close</button>
       </div>
     </div>
@@ -1801,6 +1898,10 @@ document.addEventListener('DOMContentLoaded', function () {
   var LIB = <?= json_encode(array_column($library, 'url', 'value'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_UNESCAPED_SLASHES) ?>;
   var urlFor = function (v) { v = v.trim(); return LIB[v] || v; };
 
+  // Set by the color-picker dialog's own setup below; exposed here so other sections (like the
+  // table editor's row/column tint swatches) can open the same dialog for an arbitrary color.
+  var openColorPicker;
+
   // Unsaved-changes indicator.
   var dirty = false, status = document.querySelector('[data-status]');
   function markDirty() {
@@ -1821,12 +1922,189 @@ document.addEventListener('DOMContentLoaded', function () {
     r.addEventListener('input', function () { out.textContent = Math.round(r.value * (px ? 1 : 100)) + (px ? 'px' : '%'); });
   });
 
-  // Table width: 0 reads as "Auto" (size to fit the content) instead of "0%".
+  // Color fields: a custom picker dialog (gradient square + hue slider + hex/RGB entry) replaces
+  // the native <input type=color>, whose UI varies wildly by platform and, on Android in
+  // particular, often has no way to type an exact hex/RGB value at all.
+  (function () {
+    var dlg = document.getElementById('colorPicker');
+    if (!dlg) return;
+    var sv = dlg.querySelector('[data-cp-sv]');
+    var svCursor = dlg.querySelector('[data-cp-sv-cursor]');
+    var hueSlider = dlg.querySelector('[data-cp-hue]');
+    var hueThumb = dlg.querySelector('[data-cp-hue-thumb]');
+    var hexInput = dlg.querySelector('[data-cp-hex]');
+    var rInput = dlg.querySelector('[data-cp-r]'), gInput = dlg.querySelector('[data-cp-g]'), bInput = dlg.querySelector('[data-cp-b]');
+    var preview = dlg.querySelector('[data-cp-preview]');
+    var title = dlg.querySelector('[data-cp-title]');
+    var active = null; // the .color-field currently being edited, for the static swatch+hex fields
+    var onChangeCb = null, onCloseCb = null; // used instead of `active` for dynamic callers (e.g. the table editor)
+    var hsv = { h: 0, s: 0, v: 0 };
+
+    function hsvToRgb(h, s, v) {
+      s /= 100; v /= 100;
+      var c = v * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = v - c, r, g, b;
+      if (h < 60) { r = c; g = x; b = 0; }
+      else if (h < 120) { r = x; g = c; b = 0; }
+      else if (h < 180) { r = 0; g = c; b = x; }
+      else if (h < 240) { r = 0; g = x; b = c; }
+      else if (h < 300) { r = x; g = 0; b = c; }
+      else { r = c; g = 0; b = x; }
+      return { r: Math.round((r + m) * 255), g: Math.round((g + m) * 255), b: Math.round((b + m) * 255) };
+    }
+    function rgbToHsv(r, g, b) {
+      r /= 255; g /= 255; b /= 255;
+      var max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min, h = 0;
+      if (d !== 0) {
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+        h *= 60;
+        if (h < 0) h += 360;
+      }
+      return { h: h, s: max === 0 ? 0 : (d / max) * 100, v: max * 100 };
+    }
+    function toHex2(n) { return n.toString(16).padStart(2, '0'); }
+    function rgbToHex(r, g, b) { return '#' + toHex2(r) + toHex2(g) + toHex2(b); }
+    function hexToRgb(hex) {
+      var m = /^#([0-9a-f]{6})$/i.exec(hex.trim());
+      if (!m) return null;
+      var n = parseInt(m[1], 16);
+      return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+    }
+
+    function render() {
+      var rgb = hsvToRgb(hsv.h, hsv.s, hsv.v);
+      var hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+      sv.style.setProperty('--cp-hue', hsv.h);
+      svCursor.style.left = hsv.s + '%';
+      svCursor.style.top = (100 - hsv.v) + '%';
+      hueThumb.style.left = (hsv.h / 360 * 100) + '%';
+      hexInput.value = hex;
+      rInput.value = rgb.r; gInput.value = rgb.g; bInput.value = rgb.b;
+      preview.style.background = hex;
+      if (title) title.textContent = hex;
+    }
+    function apply() {
+      var rgb = hsvToRgb(hsv.h, hsv.s, hsv.v);
+      var hex = rgbToHex(rgb.r, rgb.g, rgb.b);
+      if (active) {
+        active.querySelector('[data-color-swatch]').style.background = hex;
+        active.querySelector('[data-color-hex]').value = hex;
+        var hidden = active.nextElementSibling;
+        if (hidden && hidden.matches('[data-color-value]')) {
+          hidden.value = hex;
+          hidden.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }
+      if (onChangeCb) onChangeCb(hex);
+    }
+    function setFromHex(hex) {
+      var rgb = hexToRgb(hex);
+      if (!rgb) return;
+      hsv = rgbToHsv(rgb.r, rgb.g, rgb.b);
+      render();
+      apply();
+    }
+    function setFromRgbInputs() {
+      var r = Math.max(0, Math.min(255, parseInt(rInput.value, 10) || 0));
+      var g = Math.max(0, Math.min(255, parseInt(gInput.value, 10) || 0));
+      var b = Math.max(0, Math.min(255, parseInt(bInput.value, 10) || 0));
+      hsv = rgbToHsv(r, g, b);
+      render();
+      apply();
+    }
+
+    function dragOn(el, onMove) {
+      el.addEventListener('pointerdown', function (e) {
+        el.setPointerCapture(e.pointerId);
+        onMove(e);
+        function move(ev) { onMove(ev); }
+        function up(ev) {
+          el.releasePointerCapture(ev.pointerId);
+          el.removeEventListener('pointermove', move);
+          el.removeEventListener('pointerup', up);
+        }
+        el.addEventListener('pointermove', move);
+        el.addEventListener('pointerup', up);
+        e.preventDefault();
+      });
+    }
+    dragOn(sv, function (e) {
+      var r = sv.getBoundingClientRect();
+      var x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+      var y = Math.max(0, Math.min(1, (e.clientY - r.top) / r.height));
+      hsv.s = x * 100;
+      hsv.v = (1 - y) * 100;
+      render();
+      apply();
+    });
+    dragOn(hueSlider, function (e) {
+      var r = hueSlider.getBoundingClientRect();
+      var x = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+      hsv.h = x * 360;
+      render();
+      apply();
+    });
+    hexInput.addEventListener('change', function () { setFromHex(hexInput.value); });
+    [rInput, gInput, bInput].forEach(function (inp) { inp.addEventListener('change', setFromRgbInputs); });
+
+    // Opens the dialog for an arbitrary color, outside the static swatch+hex+hidden-input markup —
+    // used by the table editor's row/column tint swatches. onChange fires live while dragging;
+    // onClose fires once, after the dialog is dismissed.
+    openColorPicker = function (hex, onChange, onClose) {
+      active = null;
+      onChangeCb = onChange || null;
+      onCloseCb = onClose || null;
+      setFromHex(/^#[0-9a-f]{6}$/i.test(hex) ? hex : '#ffffff');
+      dlg.showModal();
+    };
+    dlg.addEventListener('close', function () {
+      var cb = onCloseCb;
+      onChangeCb = null;
+      onCloseCb = null;
+      if (cb) cb();
+    });
+
+    document.querySelectorAll('[data-color-swatch]').forEach(function (swatch) {
+      swatch.addEventListener('click', function () {
+        active = swatch.closest('[data-color-field]');
+        onChangeCb = null;
+        onCloseCb = null;
+        var hex = active.querySelector('[data-color-hex]').value || '#ffffff';
+        setFromHex(/^#[0-9a-f]{6}$/i.test(hex) ? hex : '#ffffff');
+        dlg.showModal();
+      });
+    });
+    // Typing the hex field next to the swatch directly also updates live, without opening the dialog.
+    document.querySelectorAll('[data-color-hex]').forEach(function (hex) {
+      hex.addEventListener('input', function () {
+        var v = hex.value.trim();
+        if (!/^#[0-9a-f]{6}$/i.test(v)) return;
+        var field = hex.closest('[data-color-field]');
+        field.querySelector('[data-color-swatch]').style.background = v;
+        var hidden = field.nextElementSibling;
+        if (hidden && hidden.matches('[data-color-value]')) {
+          hidden.value = v;
+          hidden.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      });
+    });
+    dlg.querySelectorAll('[data-close]').forEach(function (b) { b.addEventListener('click', function () { dlg.close(); }); });
+  })();
+
+  // Table width/height: 0 reads as "Auto" (size to fit the content) instead of "0%".
   var widthSlider = form.querySelector('[data-table-width]');
   if (widthSlider) {
     var widthOut = form.querySelector('[data-table-width-out]');
     widthSlider.addEventListener('input', function () {
       widthOut.textContent = widthSlider.value > 0 ? widthSlider.value + '%' : 'Auto';
+    });
+  }
+  var heightSlider = form.querySelector('[data-table-height]');
+  if (heightSlider) {
+    var heightOut = form.querySelector('[data-table-height-out]');
+    heightSlider.addEventListener('input', function () {
+      heightOut.textContent = heightSlider.value > 0 ? heightSlider.value + '%' : 'Auto';
     });
   }
 
@@ -1906,16 +2184,25 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // A color swatch plus a small clear button, bound to get/set(value) for one row or column.
+    // Opens the same modern color-picker dialog the other color fields use, rather than a native
+    // <input type=color> — consistent everywhere, and gives Android a way to type an exact value.
     function colorControl(get, set, label) {
       var wrap = document.createElement('span');
       wrap.className = 'table-editor__swatch-wrap';
-      var input = document.createElement('input');
-      input.type = 'color';
-      input.className = 'table-editor__swatch';
-      input.title = label;
-      input.value = get() || '#000000';
-      input.addEventListener('input', function () { set(input.value); sync(); });
-      wrap.appendChild(input);
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'table-editor__swatch';
+      btn.title = label;
+      btn.style.background = get() || '#000000';
+      btn.addEventListener('click', function () {
+        if (!openColorPicker) return;
+        openColorPicker(
+          get() || '#000000',
+          function (hex) { btn.style.background = hex; set(hex); sync(); },
+          function () { renderGrid(); }
+        );
+      });
+      wrap.appendChild(btn);
       if (get()) {
         var clear = document.createElement('button');
         clear.type = 'button'; clear.className = 'table-editor__swatch-clear';
@@ -2030,6 +2317,46 @@ document.addEventListener('DOMContentLoaded', function () {
   var pv = document.querySelector('[data-preview]');
   if (pv) {
     var frame = pv.querySelector('iframe'), mode = 'tv';
+    var points = pv.querySelectorAll('[data-table-point]');
+    var offsetXInput = form.querySelector('[data-table-offset-x]');
+    var offsetYInput = form.querySelector('[data-table-offset-y]');
+    var curScale = 1, curLeft = 0;
+    // Dragging the table body itself nudges its position (like cropping an image), on top of
+    // whatever the H/V alignment picks as the base position. Bound fresh on every load since the
+    // iframe's document (and its elements) is recreated each time. Binds to .slide__table-pos (the
+    // div that carries the position/size), not .slide__table-wrap or the <table> nested inside it.
+    function bindTableMove(doc) {
+      var wrap = doc.querySelector('.slide__table-pos');
+      if (!wrap || !offsetXInput || !offsetYInput) return;
+      wrap.style.cursor = 'grab';
+      wrap.addEventListener('pointerdown', function (e) {
+        e.preventDefault();
+        var startX = e.clientX, startY = e.clientY;
+        var startOffsetX = parseFloat(offsetXInput.value) || 0;
+        var startOffsetY = parseFloat(offsetYInput.value) || 0;
+        wrap.setPointerCapture(e.pointerId);
+        wrap.style.cursor = 'grabbing';
+        function onMove(ev) {
+          var nx = Math.round(startOffsetX + (ev.clientX - startX));
+          var ny = Math.round(startOffsetY + (ev.clientY - startY));
+          wrap.style.setProperty('--table-offset-x', nx + 'px');
+          wrap.style.setProperty('--table-offset-y', ny + 'px');
+          offsetXInput.value = nx + 'px';
+          offsetYInput.value = ny + 'px';
+          placePoints();
+        }
+        function onUp(ev) {
+          wrap.style.cursor = 'grab';
+          wrap.releasePointerCapture(ev.pointerId);
+          doc.removeEventListener('pointermove', onMove);
+          doc.removeEventListener('pointerup', onUp);
+          offsetXInput.dispatchEvent(new Event('input', { bubbles: true }));
+          offsetYInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        doc.addEventListener('pointermove', onMove);
+        doc.addEventListener('pointerup', onUp);
+      });
+    }
     // The preview page is its own fullscreen, non-scrolling document (overflow: hidden), so a
     // wheel scroll over it would otherwise just do nothing instead of scrolling this admin page.
     // Same-origin iframe, so we can reach in and forward the scroll to the parent ourselves.
@@ -2053,7 +2380,9 @@ document.addEventListener('DOMContentLoaded', function () {
           touchY = y;
         }, { passive: true });
         doc.addEventListener('touchend', function () { touchY = null; }, { passive: true });
+        bindTableMove(doc);
       } catch (e) {}
+      placePoints();
     });
     function fit() {
       // TV: wide landscape, like a living-room screen. Phone: tall portrait.
@@ -2065,7 +2394,138 @@ document.addEventListener('DOMContentLoaded', function () {
       frame.style.transform = 'scale(' + s + ')';
       frame.style.left = Math.max(0, (avail - w * s) / 2) + 'px';
       pv.style.height = Math.round(h * s) + 'px';
+      curScale = s;
+      curLeft = Math.max(0, (avail - w * s) / 2);
+      placePoints();
     }
+
+    // The preview iframe is same-origin, so rather than round-tripping through the form we
+    // read/write its table element directly and mirror the result onto the width/height sliders
+    // (and vice versa for their own output labels).
+    function tableEls() {
+      try {
+        var doc = frame.contentDocument;
+        var wrap = doc.querySelector('.slide__table-pos');
+        var table = doc.querySelector('.slide__table');
+        var layout = doc.querySelector('.slide__table-layout');
+        return wrap && table && layout ? { doc: doc, wrap: wrap, table: table, layout: layout } : null;
+      } catch (e) { return null; }
+    }
+    // One point at each of the 8 compass positions around the table's edge, each free to drag.
+    var POINT_AT = {
+      nw: function (r) { return [r.left, r.top]; },
+      n:  function (r) { return [r.left + r.width / 2, r.top]; },
+      ne: function (r) { return [r.right, r.top]; },
+      w:  function (r) { return [r.left, r.top + r.height / 2]; },
+      e:  function (r) { return [r.right, r.top + r.height / 2]; },
+      sw: function (r) { return [r.left, r.bottom]; },
+      s:  function (r) { return [r.left + r.width / 2, r.bottom]; },
+      se: function (r) { return [r.right, r.bottom]; }
+    };
+    // Which axis each point drags, and which direction along that axis grows the table
+    // (+1 = dragging further from the table's center grows it, -1 = dragging toward it does).
+    var POINT_AXIS = {
+      n: { x: 0, y: -1 }, s: { x: 0, y: 1 }, e: { x: 1, y: 0 }, w: { x: -1, y: 0 },
+      ne: { x: 1, y: -1 }, nw: { x: -1, y: -1 }, se: { x: 1, y: 1 }, sw: { x: -1, y: 1 }
+    };
+    function placePoints() {
+      if (!points.length) return;
+      var els = tableEls();
+      if (!els) { points.forEach(function (p) { p.hidden = true; }); return; }
+      var rect = els.wrap.getBoundingClientRect();
+      points.forEach(function (p) {
+        var at = POINT_AT[p.dataset.dir](rect);
+        p.hidden = false;
+        p.style.left = (curLeft + at[0] * curScale) + 'px';
+        p.style.top = (at[1] * curScale) + 'px';
+      });
+    }
+    var roundedCheckbox = form.querySelector('[name="tableRounded"]');
+    if (roundedCheckbox) {
+      roundedCheckbox.addEventListener('change', function () {
+        var els = tableEls();
+        if (!els) return;
+        els.wrap.style.setProperty('--table-radius', roundedCheckbox.checked ? '14px' : '0px');
+      });
+    }
+    [[offsetXInput, '--table-offset-x'], [offsetYInput, '--table-offset-y']].forEach(function (pair) {
+      var input = pair[0], prop = pair[1];
+      if (!input) return;
+      // Typing a nudge value directly also live-updates the preview, the same as dragging does.
+      input.addEventListener('input', function () {
+        var els = tableEls();
+        if (!els) return;
+        els.wrap.style.setProperty(prop, input.value || '0px');
+        placePoints();
+      });
+    });
+    // A size slider's own typing/dragging also live-updates the preview, same as a point does
+    // (its own output label is kept in sync separately, where the slider is first set up).
+    [[widthSlider, 'width', 'slide__table--sized'], [heightSlider, 'height', null]].forEach(function (cfg) {
+      var slider = cfg[0], prop = cfg[1], sizedClass = cfg[2];
+      if (!slider) return;
+      slider.addEventListener('input', function () {
+        var els = tableEls();
+        if (!els) return;
+        var pct = parseInt(slider.value, 10) || 0;
+        els.wrap.style[prop] = pct > 0 ? pct + '%' : '';
+        if (sizedClass) els.table.classList.toggle(sizedClass, pct > 0);
+        placePoints();
+      });
+    });
+    if (widthSlider && heightSlider) {
+      points.forEach(function (p) {
+        var axis = POINT_AXIS[p.dataset.dir];
+        p.addEventListener('pointerdown', function (e) {
+          var els = tableEls();
+          if (!els) return;
+          var startX = e.clientX, startY = e.clientY;
+          var startRect = els.wrap.getBoundingClientRect();
+          var layoutRect = els.layout.getBoundingClientRect();
+          var layoutCs = els.doc.defaultView.getComputedStyle(els.layout);
+          var contentWidth = layoutRect.width - parseFloat(layoutCs.paddingLeft) - parseFloat(layoutCs.paddingRight);
+          var contentHeight = layoutRect.height - parseFloat(layoutCs.paddingTop) - parseFloat(layoutCs.paddingBottom);
+          p.classList.add('is-dragging');
+          p.setPointerCapture(e.pointerId);
+          function onMove(ev) {
+            if (axis.x !== 0) {
+              var deltaW = axis.x * (ev.clientX - startX) / curScale;
+              var pctW = Math.max(5, Math.min(100, Math.round((startRect.width + deltaW) / contentWidth * 100)));
+              els.wrap.style.width = pctW + '%';
+              els.table.classList.add('slide__table--sized');
+              widthSlider.value = pctW;
+              widthOut.textContent = pctW + '%';
+            }
+            if (axis.y !== 0) {
+              var deltaH = axis.y * (ev.clientY - startY) / curScale;
+              var pctH = Math.max(5, Math.min(100, Math.round((startRect.height + deltaH) / contentHeight * 100)));
+              els.wrap.style.height = pctH + '%';
+              heightSlider.value = pctH;
+              heightOut.textContent = pctH + '%';
+            }
+            placePoints();
+          }
+          function onUp(ev) {
+            p.classList.remove('is-dragging');
+            p.releasePointerCapture(ev.pointerId);
+            document.removeEventListener('pointermove', onMove);
+            document.removeEventListener('pointerup', onUp);
+            if (axis.x !== 0) {
+              widthSlider.dispatchEvent(new Event('input', { bubbles: true }));
+              widthSlider.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            if (axis.y !== 0) {
+              heightSlider.dispatchEvent(new Event('input', { bubbles: true }));
+              heightSlider.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }
+          document.addEventListener('pointermove', onMove);
+          document.addEventListener('pointerup', onUp);
+          e.preventDefault();
+        });
+      });
+    }
+
     document.querySelectorAll('[data-pv]').forEach(function (r) {
       r.addEventListener('change', function () { if (r.checked) { mode = r.value; fit(); } });
     });

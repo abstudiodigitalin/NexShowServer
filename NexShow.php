@@ -765,6 +765,10 @@ function xs_frame_table($json, array $tags)
         $v = (string) $v;
         return preg_match('/^#[0-9a-f]{6}$/i', $v) ? $v : $fallback;
     };
+    $len = function ($v, $fallback) {
+        $v = trim((string) $v);
+        return preg_match('/^-?\d+(\.\d+)?(px|%|rem|em|vw|vh)$/', $v) ? $v : $fallback;
+    };
     // One optional hex (or null for "no tint") per row/column, capped to the grid's actual size.
     $hexList = function ($list, $n) use ($hex) {
         $out = [];
@@ -779,9 +783,13 @@ function xs_frame_table($json, array $tags)
     return [
         'rows'           => $rows,
         'headerRow'      => !empty($t['headerRow']),
+        'rounded'        => !empty($t['rounded']),
         'hAlign'         => in_array($t['hAlign'] ?? '', ['left', 'center', 'right'], true) ? $t['hAlign'] : 'center',
         'vAlign'         => in_array($t['vAlign'] ?? '', ['top', 'center', 'bottom'], true) ? $t['vAlign'] : 'center',
+        'offsetX'        => $len($t['offsetX'] ?? '', '0px'),
+        'offsetY'        => $len($t['offsetY'] ?? '', '0px'),
         'width'          => max(0, min(100, (int) ($t['width'] ?? 0))), // 0 = size to fit the content
+        'height'         => max(0, min(100, (int) ($t['height'] ?? 0))), // 0 = size to fit the content
         'fontSize'       => max(10, min(200, (int) ($t['fontSize'] ?? 16))),
         'headerFontSize' => max(10, min(200, (int) ($t['headerFontSize'] ?? $t['fontSize'] ?? 16))),
         'textColor'      => $hex($t['textColor'] ?? '', '#ffffff'),
@@ -1063,12 +1071,36 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
 .slide__table-layout.h-left { justify-content: flex-start; }
 .slide__table-layout.h-center { justify-content: center; }
 .slide__table-layout.h-right { justify-content: flex-end; }
-.slide__table {
+/* The background/blur, size and rounding live on .slide__table-wrap rather than the <table> itself
+   — a table using border-collapse ignores border-radius/overflow on its own box in most browsers,
+   so corners never actually clipped when those lived directly on .slide__table. The position nudge
+   lives on the separate outer .slide__table-pos instead of on .slide__table-wrap itself: combining
+   `transform` with `backdrop-filter` + `border-radius` + `overflow:hidden` on one element is a known
+   browser bug that paints the clipped-off corners solid black instead of leaving them transparent. */
+.slide__table-pos {
   pointer-events: auto;
-  border-collapse: collapse;
+  transform: translate(var(--table-offset-x, 0px), var(--table-offset-y, 0px));
+}
+.slide__table-wrap {
+  width: 100%;
+  height: 100%;
   background: rgba(10, 9, 8, var(--table-bg-opacity, 0.55));
-  backdrop-filter: blur(6px);
-  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(calc(6px * var(--table-bg-opacity, 0.55)));
+  -webkit-backdrop-filter: blur(calc(6px * var(--table-bg-opacity, 0.55)));
+  border-radius: var(--table-radius, 0px);
+  overflow: hidden;
+}
+.slide__table {
+  width: 100%;
+  height: 100%;
+  /* Collapsed borders paint as a single square outline that ignores border-radius entirely — a
+     long-standing gap in every major browser's table rendering. border-radius/overflow on the
+     <table> box itself (tried previously) is no more reliable: `overflow` on a table element is
+     inconsistently honored too. The one part of a table that reliably respects its own
+     border-radius is an individual cell, so border-collapse: separate switches off the collapsed
+     border model, and the 4 corner cells below are rounded directly, on themselves. */
+  border-collapse: separate;
+  border-spacing: 0;
   font-family: var(--font-ui);
   color: var(--table-text-color, #fff);
   text-shadow: 0 1px 10px rgba(0, 0, 0, 0.3);
@@ -1080,8 +1112,21 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
   white-space: nowrap;
   text-align: center;
 }
+/* With border-collapse: separate (needed for the corner rounding below), each cell draws its own
+   full border, so shared interior edges would otherwise look twice as thick as the outer edge.
+   Drop the inner-facing side on every cell but the first in its row/column so interior lines
+   stay single. */
+.slide__table td + td, .slide__table th + th { border-left: 0; }
+.slide__table tr + tr td, .slide__table tr + tr th { border-top: 0; }
+/* Round each outer corner on the cell that actually sits there — both its border and its own
+   background (e.g. a per-row/column tint) follow a cell's own border-radius natively, with no
+   dependence on overflow/clipping at the table level at all. */
+.slide__table tr:first-child td:first-child, .slide__table tr:first-child th:first-child { border-top-left-radius: var(--table-radius, 0px); }
+.slide__table tr:first-child td:last-child, .slide__table tr:first-child th:last-child { border-top-right-radius: var(--table-radius, 0px); }
+.slide__table tr:last-child td:first-child, .slide__table tr:last-child th:first-child { border-bottom-left-radius: var(--table-radius, 0px); }
+.slide__table tr:last-child td:last-child, .slide__table tr:last-child th:last-child { border-bottom-right-radius: var(--table-radius, 0px); }
 /* A set width (rather than auto) only sticks if the table actually distributes columns to fit it. */
-.slide__table--sized { width: 100%; table-layout: fixed; }
+.slide__table--sized { table-layout: fixed; }
 .slide__table--sized td, .slide__table--sized th { white-space: normal; word-break: break-word; }
 .slide__table tr.is-header th {
   color: var(--table-header-color, var(--accent));
@@ -1380,10 +1425,16 @@ setInterval(function () {
         . '--table-border-color:' . $tbl['borderColor'] . ';'
         . '--table-border-width:' . $tbl['borderWidth'] . 'px;'
         . '--table-bg-opacity:' . $tbl['bgOpacity'] . ';'
-        . ($tbl['width'] > 0 ? 'width:' . $tbl['width'] . '%;' : '');
+        . '--table-radius:' . ($tbl['rounded'] ? '14px' : '0px') . ';'
+        . '--table-offset-x:' . $tbl['offsetX'] . ';'
+        . '--table-offset-y:' . $tbl['offsetY'] . ';'
+        . ($tbl['width'] > 0 ? 'width:' . $tbl['width'] . '%;' : '')
+        . ($tbl['height'] > 0 ? 'height:' . $tbl['height'] . '%;' : '');
 ?>
       <div class="slide__table-layout v-<?= e($tbl['vAlign']) ?> h-<?= e($tbl['hAlign']) ?>">
-        <table class="slide__table<?= $tbl['width'] > 0 ? ' slide__table--sized' : '' ?>" style="<?= e($tblStyle) ?>">
+        <div class="slide__table-pos" style="<?= e($tblStyle) ?>">
+          <div class="slide__table-wrap">
+            <table class="slide__table<?= $tbl['width'] > 0 ? ' slide__table--sized' : '' ?>">
 <?php foreach ($tbl['rows'] as $ri => $row):
     $isHead = $ri === 0 && $tbl['headerRow'];
     $tag = $isHead ? 'th' : 'td';
@@ -1398,7 +1449,9 @@ setInterval(function () {
 <?php endforeach; ?>
           </tr>
 <?php endforeach; ?>
-        </table>
+            </table>
+          </div>
+        </div>
       </div>
 <?php endif; ?>
     </div>
