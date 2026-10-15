@@ -520,7 +520,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $role = xs_enum($_POST['role'] ?? '', ['admin', 'user'], 'user');
                 if ($username === '') xs_redirect('view=settings', 'Choose a username.', 'error');
                 if (strlen($pw) < 8) xs_redirect('view=settings', 'Use at least 8 characters.', 'error');
-                xs_db_create_user($companyId, $username, password_hash($pw, PASSWORD_DEFAULT), $role);
+                $isTrial = xs_db_create_user($companyId, $username, password_hash($pw, PASSWORD_DEFAULT), $role);
+                if ($isTrial) {
+                    xs_redirect('view=settings', 'User added — free for 3 days. A payment will be needed to keep it active after that.');
+                }
                 xs_redirect('view=settings&activate=' . rawurlencode($username), 'User added. Make a payment to activate it.');
                 break;
 
@@ -531,6 +534,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($targetId === (int) $_SESSION['xs_user_id']) xs_redirect('view=settings', "You can't deactivate your own account.", 'error');
                 $status = ($_POST['status'] ?? '') === 'active' ? 'active' : 'inactive';
                 $target = xs_db_find_company_user($companyId, $targetId);
+                // A user whose expiry has already passed is treated as needing payment again,
+                // same as if it had already been auto-expired — it just hasn't been yet, because
+                // nothing has logged in or had an open session poll since to trigger that. Self-
+                // heal it right here rather than letting a stale payment_status of 'paid' let it
+                // through: xs_db_expire_user() resets payment_status to 'none', so the normal
+                // "needs payment" guard right after then correctly blocks it.
+                if ($status === 'active' && $target && xs_user_is_expired($target)) {
+                    xs_db_expire_user($targetId);
+                    $target['payment_status'] = 'none';
+                }
                 // Only a user whose fee is actually marked 'paid' can be switched back on from
                 // here — 'pending' (awaiting confirmation) or 'none' (never paid, or expired and
                 // reset back to needing a fresh payment) both require going through the payment

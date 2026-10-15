@@ -22,6 +22,14 @@ define('XS_DB_NAME', 'NexShoW_db');
 define('XS_DB_USER', 'your_db_user');
 define('XS_DB_PASS', 'your_db_password');
 
+// PHP defaults to UTC if nothing sets this, but MySQL's NOW() reflects the server's own system
+// clock. Every expires_at / reset_token_expires comparison mixes a PHP-built date string with a
+// MySQL NOW() — if the two disagree about what time it is, those comparisons are wrong by the
+// gap between them (expiry firing hours late, reset links expiring instantly or not at all).
+// Pinning both to the same zone here is what keeps them in agreement — set this to whatever
+// timezone your MySQL server's clock actually runs on.
+date_default_timezone_set('Asia/Kolkata');
+
 /** Shared PDO connection. Returns null (never throws) if MySQL is unreachable. */
 function xs_db()
 {

@@ -105,24 +105,21 @@ if (!isset($_GET['show']) && !isset($_GET['preview'])) {
     // No separate device account — this screen logs in with the same username+password as
     // admin.php (the `users` table). Whoever logs in here sees their own company's menu/show.
     $deviceAuthed = !empty($_SESSION['xs_device_auth']) && !empty($_SESSION['xs_device_company_id']) && !empty($_SESSION['xs_device_user_id']);
-    // 'user' role accounts expire 1 year after creation; admins never do — checked at login
-    // and again here on every request, so a session left open since before the expiry date
-    // is signed out the moment it crosses it (matters most for ?show=1, which can sit open
-    // on a screen for a long time).
-    if ($deviceAuthed && !empty($_SESSION['xs_device_expires_at']) && strtotime($_SESSION['xs_device_expires_at']) <= time()) {
-        xs_db_expire_user((int) $_SESSION['xs_device_user_id']);
-        $_SESSION = [];
-        $_SESSION['device_flash'] = ['error', 'That account has expired. Contact your admin.'];
-        session_regenerate_id(true);
-        $deviceAuthed = false;
-    }
-    // Single device session per user (logging in elsewhere overwrites device_session_token)
-    // and deactivation (an admin can turn a user off mid-session from admin.php's Users panel)
-    // both need a real read, not something session-cached like expiry above — so one fresh
-    // lookup here covers both, signing this device out the next time it's seen here.
+    // Expiry, deactivation (an admin turning this user off from admin.php's Users panel) and a
+    // fresh login elsewhere (which overwrites device_session_token) all need a real read of the
+    // current row, not anything session-cached — otherwise a direct database edit to any of
+    // those columns would sit there doing nothing until this device happens to log out and back
+    // in. One fresh lookup here covers all three, signing this device out the next time it's
+    // seen here.
     if ($deviceAuthed) {
         $currentDeviceUser = xs_db_find_user_by_id((int) $_SESSION['xs_device_user_id']);
-        if ($currentDeviceUser !== null && $currentDeviceUser['status'] !== 'active') {
+        if ($currentDeviceUser !== null && xs_user_is_expired($currentDeviceUser)) {
+            xs_db_expire_user((int) $_SESSION['xs_device_user_id']);
+            $_SESSION = [];
+            $_SESSION['device_flash'] = ['error', 'That account has expired. Contact your admin.'];
+            session_regenerate_id(true);
+            $deviceAuthed = false;
+        } elseif ($currentDeviceUser !== null && $currentDeviceUser['status'] !== 'active') {
             $_SESSION = [];
             $_SESSION['device_flash'] = ['error', 'This account has been deactivated. Contact your admin.'];
             session_regenerate_id(true);
@@ -661,23 +658,42 @@ $companyId = null;
 if (isset($_GET['preview'])) {
     session_name('nexshow_admin');
     session_start();
-    $adminExpired = !empty($_SESSION['xs_expires_at']) && strtotime($_SESSION['xs_expires_at']) <= time();
-    if (!$adminExpired && !empty($_SESSION['xs_auth']) && !empty($_SESSION['xs_company_id'])) {
+    $adminOk = !empty($_SESSION['xs_auth']) && !empty($_SESSION['xs_company_id']) && !empty($_SESSION['xs_user_id']);
+    // The preview iframe can be left open on an editing screen indefinitely without the outer
+    // admin.php page ever reloading (which is the only other place this gets checked) — so a
+    // fresh read (not anything session-cached) here means a direct database edit to expires_at
+    // takes effect on the next time this renders, not just the admin's next login.
+    if ($adminOk) {
+        $currentAdminUser = xs_db_find_user_by_id((int) $_SESSION['xs_user_id']);
+        if ($currentAdminUser !== null && xs_user_is_expired($currentAdminUser)) {
+            xs_db_expire_user((int) $_SESSION['xs_user_id']);
+            $adminOk = false;
+        }
+    }
+    if ($adminOk) {
         $companyId = (int) $_SESSION['xs_company_id'];
     }
 } else {
     session_name('nexshow_device');
     session_start();
-    $deviceExpired = !empty($_SESSION['xs_device_expires_at']) && strtotime($_SESSION['xs_device_expires_at']) <= time();
-    $deviceOk = !$deviceExpired && !empty($_SESSION['xs_device_auth']) && !empty($_SESSION['xs_device_company_id']) && !empty($_SESSION['xs_device_user_id']);
+    $deviceOk = !empty($_SESSION['xs_device_auth']) && !empty($_SESSION['xs_device_company_id']) && !empty($_SESSION['xs_device_user_id']);
+    $deviceExpired = false;
     $deviceKicked = false;
     $deviceDeactivated = false;
     if ($deviceOk) {
-        // Same checks as the device gate above: a fresh login elsewhere overwrites
-        // device_session_token, and an admin can deactivate this user mid-session — either
-        // signs this (now stale) session out too.
+        // The live show is meant to sit open on a kiosk/TV indefinitely, polling this same
+        // endpoint in a loop — it may never revisit the plain device-menu page again, which is
+        // the only other place this gets checked. A fresh read (not anything session-cached)
+        // covers expiry, deactivation (an admin turning this user off from admin.php's Users
+        // panel) and a fresh login elsewhere (which overwrites device_session_token) — so a
+        // direct database edit to any of those takes effect on the very next poll, not just
+        // the next full login.
         $currentDeviceUser = xs_db_find_user_by_id((int) $_SESSION['xs_device_user_id']);
-        if ($currentDeviceUser !== null && $currentDeviceUser['status'] !== 'active') {
+        if ($currentDeviceUser !== null && xs_user_is_expired($currentDeviceUser)) {
+            xs_db_expire_user((int) $_SESSION['xs_device_user_id']);
+            $deviceOk = false;
+            $deviceExpired = true;
+        } elseif ($currentDeviceUser !== null && $currentDeviceUser['status'] !== 'active') {
             $deviceOk = false;
             $deviceDeactivated = true;
         } elseif ($currentDeviceUser !== null && (string) $currentDeviceUser['device_session_token'] !== (string) ($_SESSION['xs_device_token'] ?? '')) {
@@ -1331,10 +1347,10 @@ setInterval(function () {
         <img class="slide__img" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" alt="<?= e($s['alt'] ?? '') ?>" loading="<?= $isStart ? 'eager' : 'lazy' ?>" fetchpriority="<?= $isStart ? 'high' : 'auto' ?>" decoding="async" draggable="false" />
 <?php elseif ($s['imageIsVideo'] && $s['mobileUrl']): ?>
         <!-- The uploaded video plays on larger screens; the Phone image covers small ones. -->
-        <video class="slide__img slide__img--video" data-breakpoint="desktop" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="none" aria-hidden="true" tabindex="-1"></video>
+        <video class="slide__img slide__img--video" data-breakpoint="desktop" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
         <img class="slide__img" data-breakpoint="mobile" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['mobileUrl']) ?>" alt="<?= e($s['alt'] ?? '') ?>" loading="<?= $isStart ? 'eager' : 'lazy' ?>" decoding="async" draggable="false" />
 <?php elseif ($s['imageIsVideo']): ?>
-        <video class="slide__img slide__img--video" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="none" aria-hidden="true" tabindex="-1"></video>
+        <video class="slide__img slide__img--video" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
 <?php endif; ?>
       </div>
 <?php if ($s['overlay']): ?>
@@ -1477,11 +1493,17 @@ setInterval(function () {
       });
     });
   }
+  // Tracks which slide updateVideos() last considered active, so a video resuming only because
+  // of an unrelated render() (hover pause/resume, a resize, …) keeps its position, while actually
+  // arriving back on this slide — even on a later lap of the same loop — restarts it at 0.
+  var lastVideoIndex = -1;
   function updateVideos() {
+    var indexChanged = index !== lastVideoIndex;
     slides.forEach(function (el, i) {
       el.querySelectorAll('.slide__img--video').forEach(function (video) {
         var canPlay = i === index && !reducedMQ.matches && !tabHidden && video.offsetWidth > 0;
         if (canPlay) {
+          if (indexChanged) video.currentTime = 0;
           video.muted = !soundUnlocked;
           var p = video.play();
           if (p && p.catch) {
@@ -1500,6 +1522,7 @@ setInterval(function () {
         }
       });
     });
+    lastVideoIndex = index;
   }
 
   function isPlaying() {
