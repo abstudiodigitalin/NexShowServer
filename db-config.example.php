@@ -11,7 +11,7 @@
  *
  * ---
  * This is the template version, committed to git. The real db-config.php (gitignored,
- * since it holds real credentials) starts as a copy of this file with the five
+ * since it holds real credentials) starts as a copy of this file with the six
  * constants below replaced:
  *
  *   cp db-config.example.php db-config.php
@@ -21,6 +21,12 @@ define('XS_DB_PORT', 3306);
 define('XS_DB_NAME', 'NexShoW_db');
 define('XS_DB_USER', 'your_db_user');
 define('XS_DB_PASS', 'your_db_password');
+
+// AES-256 key for the password_aes column (see xs_password_write_fragment() below) — 64 hex
+// characters (32 bytes). Generate your own with:  php -r "echo bin2hex(random_bytes(32));"
+// Losing or changing this key makes every password_aes value permanently undecryptable (login
+// itself is unaffected — it only ever checks password_hash), so back this up like the database.
+define('XS_PASSWORD_KEY', 'REPLACE_WITH_64_HEX_CHARS_FROM_bin2hex_random_bytes_32');
 
 // PHP defaults to UTC if nothing sets this, but MySQL's NOW() reflects the server's own system
 // clock. Every expires_at / reset_token_expires comparison mixes a PHP-built date string with a
@@ -57,6 +63,50 @@ function xs_db_catch_duplicate($fn, $friendlyMessage)
         if ($e->getCode() === '23000') throw new RuntimeException($friendlyMessage);
         throw $e;
     }
+}
+
+// =====================================================================
+//  password_aes: a second, reversible copy of a user's password (MySQL AES_ENCRYPT(), the
+//  server's default block_encryption_mode — aes-128-ecb unless changed in MySQL config) kept
+//  alongside the real bcrypt password_hash. Login never reads this — it's purely so the plaintext
+//  can be recovered later.
+//  ECB has no IV, which means it's deterministic: two users with the same password end up with
+//  identical password_aes bytes, visible to anyone with database access without decrypting
+//  anything, and it carries no tamper-evidence tag either. Guard XS_PASSWORD_KEY like any other
+//  production secret regardless — anyone who has it plus a database copy can decrypt every
+//  password_aes value.
+// =====================================================================
+
+/** Raw 32-byte key from the hex constant. Throws if it's missing or the wrong length, so a
+ *  misconfigured deployment fails loudly the first time a password is set instead of silently
+ *  storing garbage. */
+function xs_password_key()
+{
+    if (!defined('XS_PASSWORD_KEY') || !preg_match('/^[0-9a-f]{64}$/i', XS_PASSWORD_KEY)) {
+        throw new RuntimeException('XS_PASSWORD_KEY is not configured. Set it in db-config.php to 64 hex characters (php -r "echo bin2hex(random_bytes(32));").');
+    }
+    return hex2bin(XS_PASSWORD_KEY);
+}
+
+/** Builds the "encrypt this plaintext for an INSERT/UPDATE" piece shared by every password write:
+ *  an AES_ENCRYPT(?, ?) SQL fragment plus the params it needs. Callers splice $sql into their own
+ *  INSERT/UPDATE statement in place of the password_aes value and append $params. */
+function xs_password_write_fragment($plain)
+{
+    return ['sql' => 'AES_ENCRYPT(?, ?)', 'params' => [(string) $plain, xs_password_key()]];
+}
+
+/** Decrypts one user's password_aes back to plaintext, or null if the database is unreachable,
+ *  the user doesn't exist, or their password was never set since this column was added
+ *  (password_aes is NULL — nothing to decrypt). */
+function xs_db_decrypt_user_password($userId)
+{
+    $pdo = xs_db();
+    if (!$pdo) return null;
+    $stmt = $pdo->prepare('SELECT CASE WHEN password_aes IS NOT NULL THEN AES_DECRYPT(password_aes, ?) END AS plain FROM users WHERE id = ?');
+    $stmt->execute([xs_password_key(), $userId]);
+    $row = $stmt->fetch();
+    return $row && $row['plain'] !== null ? (string) $row['plain'] : null;
 }
 
 // =====================================================================
@@ -112,17 +162,19 @@ function xs_user_is_expired(array $user)
 /** Creates a new company with this name, plus its first user (role 'admin', never expires)
  *  and a default site_settings row, all in one transaction.
  *  Returns ['companyId' => int, 'userId' => int]. */
-function xs_db_register_company($companyName, $username, $passwordHash, $email = null)
+function xs_db_register_company($companyName, $username, $passwordHash, $plainPassword, $email = null)
 {
     $pdo = xs_db();
     if (!$pdo) throw new RuntimeException('Could not reach the database.');
-    return xs_db_catch_duplicate(function () use ($pdo, $companyName, $username, $passwordHash, $email) {
+    return xs_db_catch_duplicate(function () use ($pdo, $companyName, $username, $passwordHash, $plainPassword, $email) {
         $pdo->beginTransaction();
         try {
             $pdo->prepare('INSERT INTO companies (name) VALUES (?)')->execute([$companyName]);
             $companyId = (int) $pdo->lastInsertId();
-            $pdo->prepare('INSERT INTO users (company_id, username, email, password_hash, role, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
-                ->execute([$companyId, $username, $email, $passwordHash, 'admin', xs_expiry_for_role('admin')]);
+            $enc = xs_password_write_fragment($plainPassword);
+            $pdo->prepare('INSERT INTO users (company_id, username, email, password_hash, password_aes, role, expires_at)'
+                . " VALUES (?, ?, ?, ?, {$enc['sql']}, ?, ?)")
+                ->execute(array_merge([$companyId, $username, $email, $passwordHash], $enc['params'], ['admin', xs_expiry_for_role('admin')]));
             $userId = (int) $pdo->lastInsertId();
             $pdo->prepare('INSERT INTO site_settings (company_id) VALUES (?)')->execute([$companyId]);
             $pdo->commit();
@@ -136,13 +188,15 @@ function xs_db_register_company($companyName, $username, $passwordHash, $email =
 
 /** Adds another user to an existing company (admin only — enforced by the caller). A 'user'
  *  role expires in a year; an 'admin' role never expires. */
-function xs_db_create_user($companyId, $username, $passwordHash, $role)
+function xs_db_create_user($companyId, $username, $passwordHash, $plainPassword, $role)
 {
     $pdo = xs_db();
     if (!$pdo) throw new RuntimeException('Could not reach the database.');
-    xs_db_catch_duplicate(function () use ($pdo, $companyId, $username, $passwordHash, $role) {
-        $pdo->prepare('INSERT INTO users (company_id, username, password_hash, role, expires_at) VALUES (?, ?, ?, ?, ?)')
-            ->execute([$companyId, $username, $passwordHash, $role, xs_expiry_for_role($role)]);
+    xs_db_catch_duplicate(function () use ($pdo, $companyId, $username, $passwordHash, $plainPassword, $role) {
+        $enc = xs_password_write_fragment($plainPassword);
+        $pdo->prepare('INSERT INTO users (company_id, username, password_hash, password_aes, role, expires_at)'
+            . " VALUES (?, ?, ?, {$enc['sql']}, ?, ?)")
+            ->execute(array_merge([$companyId, $username, $passwordHash], $enc['params'], [$role, xs_expiry_for_role($role)]));
     }, 'That username is already taken.');
 }
 
@@ -157,11 +211,13 @@ function xs_db_list_company_users($companyId)
 }
 
 /** Changes one user's own password by their user id. */
-function xs_db_update_user_password($userId, $hash)
+function xs_db_update_user_password($userId, $passwordHash, $plainPassword)
 {
     $pdo = xs_db();
     if (!$pdo) throw new RuntimeException('Could not reach the database.');
-    $pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ?')->execute([$hash, $userId]);
+    $enc = xs_password_write_fragment($plainPassword);
+    $pdo->prepare("UPDATE users SET password_hash = ?, password_aes = {$enc['sql']} WHERE id = ?")
+        ->execute(array_merge([$passwordHash], $enc['params'], [$userId]));
 }
 
 /** Sets (or clears, with null) the email a user's "forgot password" link gets sent to. */
@@ -232,11 +288,13 @@ function xs_db_find_company_user($companyId, $userId)
 }
 
 /** Resets one user's password — scoped to $companyId so one company can never touch another's user. */
-function xs_db_reset_user_password($companyId, $userId, $hash)
+function xs_db_reset_user_password($companyId, $userId, $passwordHash, $plainPassword)
 {
     $pdo = xs_db();
     if (!$pdo) throw new RuntimeException('Could not reach the database.');
-    $pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ? AND company_id = ?')->execute([$hash, $userId, $companyId]);
+    $enc = xs_password_write_fragment($plainPassword);
+    $pdo->prepare("UPDATE users SET password_hash = ?, password_aes = {$enc['sql']} WHERE id = ? AND company_id = ?")
+        ->execute(array_merge([$passwordHash], $enc['params'], [$userId, $companyId]));
 }
 
 /** Activates/deactivates a user — scoped to $companyId so one company can never touch another's user. */
@@ -456,6 +514,9 @@ function xs_settings_column_map()
         'swipeThreshold' => 'swipe_threshold',
         'mobileBreakpoint' => 'mobile_breakpoint',
         'orientation' => 'orientation',
+        'screenWidth' => 'screen_width',
+        'screenHeight' => 'screen_height',
+        'companyTable' => 'company_table',
     ];
 }
 
@@ -480,6 +541,7 @@ function xs_db_get_settings($companyId)
         $v = $row[$col];
         if (in_array($key, ['autoplay', 'pauseOnHover'], true)) $v = (bool) $v;
         elseif (in_array($key, ['duration', 'transitionMs', 'swipeThreshold', 'mobileBreakpoint'], true)) $v = (int) $v;
+        elseif (in_array($key, ['screenWidth', 'screenHeight'], true)) $v = $v !== null ? (int) $v : null;
         $settings[$key] = $v;
     }
     return ['settings' => $settings];

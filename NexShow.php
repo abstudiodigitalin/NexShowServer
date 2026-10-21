@@ -168,6 +168,19 @@ if (!isset($_GET['show']) && !isset($_GET['preview'])) {
                         // whichever other device was already logged in as this same user.
                         $deviceToken = bin2hex(random_bytes(20));
                         xs_db_set_device_session_token((int) $user['id'], $deviceToken);
+                        // The login form's JS fills these from screen.width/screen.height just
+                        // before submit, so admin.php's frame preview can size itself to match
+                        // this device's real screen instead of guessing 1920x1080. Sanity-bounded
+                        // so a tampered or missing value never writes something absurd.
+                        $screenW = (int) ($_POST['screen_w'] ?? 0);
+                        $screenH = (int) ($_POST['screen_h'] ?? 0);
+                        if ($screenW >= 200 && $screenW <= 10000 && $screenH >= 200 && $screenH <= 10000) {
+                            try {
+                                xs_db_save_settings((int) $user['company_id'], ['screenWidth' => $screenW, 'screenHeight' => $screenH]);
+                            } catch (RuntimeException $ex) {
+                                // Non-fatal — login proceeds even if this write fails.
+                            }
+                        }
                         session_regenerate_id(true);
                         $_SESSION['xs_device_auth'] = true;
                         $_SESSION['xs_device_user_id'] = (int) $user['id'];
@@ -426,9 +439,11 @@ function xs_device_icon($name)
 
 <?php if ($screen === 'login'): ?>
 <main class="auth">
-  <form class="auth__card" method="post" action="NexShow.php">
+  <form class="auth__card" method="post" action="NexShow.php" data-login-form>
     <input type="hidden" name="csrf" value="<?= e($deviceCsrf) ?>">
     <input type="hidden" name="action" value="device_login">
+    <input type="hidden" name="screen_w" data-screen-w>
+    <input type="hidden" name="screen_h" data-screen-h>
     <img class="auth__logo" src="images/nexshow-logo.png" alt="NexShoW">
     <h1>Sign in</h1>
     <?php if ($flash): ?><div class="flash flash--<?= e($flash[0]) ?>" role="status"><?= e($flash[1]) ?></div><?php endif; ?>
@@ -437,6 +452,21 @@ function xs_device_icon($name)
     <button class="btn" type="submit">Sign in</button>
   </form>
 </main>
+<script>
+// Fills the real screen size just before submit, so admin.php's frame preview can later size
+// itself to match this device instead of guessing — screen.width/height (not innerWidth/innerHeight)
+// since that's the physical panel's resolution, independent of how big the browser chrome is.
+(function () {
+  var form = document.querySelector('[data-login-form]');
+  if (!form) return;
+  form.addEventListener('submit', function () {
+    try {
+      form.querySelector('[data-screen-w]').value = window.screen.width || '';
+      form.querySelector('[data-screen-h]').value = window.screen.height || '';
+    } catch (e) {}
+  });
+})();
+</script>
 
 <?php elseif ($screen === 'menu'): ?>
 <div class="menu-wrap">
@@ -736,16 +766,42 @@ if (isset($_GET['check'])) {
     exit;
 }
 
+$dbSettings = null;
 if ($companyId !== null) {
-    [$pageTitle, $slider, $slides] = xs_load_company($companyId, $pageTitle, $slider, $slides);
+    [$pageTitle, $slider, $slides, $dbSettings] = xs_load_company($companyId, $pageTitle, $slider, $slides);
+}
+
+// The preview iframe for admin.php's Table Settings page isn't editing any one frame, so it
+// borrows a real frame's picture (?previewFrame=<id>, a plain "show image behind the table" pick,
+// not that frame's own table on/off setting) purely as a backdrop — table forced on regardless of
+// what that frame actually has it set to. No match (or no frames yet) falls back to no image.
+if (isset($_GET['preview']) && !empty($_GET['tableonly'])) {
+    $previewFrameId = (string) ($_GET['previewFrame'] ?? '');
+    $base = [];
+    if ($previewFrameId !== '') {
+        foreach ($slides as $fr) {
+            if (($fr['id'] ?? '') === $previewFrameId) { $base = $fr; break; }
+        }
+    }
+    $slides = [array_merge($slideDefaults, $base, ['id' => '__table_preview__', 'tableData' => json_encode(['enabled' => true])])];
 }
 
 $count = count($slides);
 $bp = (int) $slider['mobileBreakpoint'];
 $autoOverlay = ['left' => 'left', 'right' => 'right', 'center' => 'full'];
-$tags = xs_db_list_tags((int) $companyId); // {{name}} placeholders usable inside a frame's table cells
+$tags = xs_db_list_tags((int) $companyId); // {{name}} placeholders usable inside the shared table's cells
+$companyTableJson = $dbSettings['settings']['companyTable'] ?? null; // the one shared table, built in admin.php's Table Settings
 
-/** Decodes a frame's tableData JSON into a safe, well-shaped array, or null if there's no table to show. */
+/** True if a frame's own tableData says to show the shared table (the frame itself only ever
+ *  stores this one on/off flag — the table's actual content/styling is company-wide). */
+function xs_frame_wants_table($json)
+{
+    if (!$json) return false;
+    $t = json_decode($json, true);
+    return is_array($t) && !empty($t['enabled']);
+}
+
+/** Decodes the shared company table JSON into a safe, well-shaped array, or null if there's no table to show. */
 function xs_frame_table($json, array $tags)
 {
     if (!$json) return null;
@@ -812,7 +868,7 @@ foreach ($slides as $i => $slide) {
     $s['mobileUrl'] = img_url($s['mobileImage'] ?? null);
     $s['imageIsVideo'] = xs_is_video_path($s['image'] ?? ''); // the image field doubles as a video upload
     $s['overlayDir'] = $s['overlayDirection'] === 'auto' ? ($autoOverlay[$s['textAlign']] ?? 'full') : $s['overlayDirection'];
-    $s['table'] = xs_frame_table($s['tableData'] ?? null, $tags);
+    $s['table'] = xs_frame_wants_table($s['tableData'] ?? null) ? xs_frame_table($companyTableJson, $tags) : null;
 
     $vars = [
         '--focal'        => $s['focalPoint'],
@@ -1080,6 +1136,15 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
 .slide__table-pos {
   pointer-events: auto;
   transform: translate(var(--table-offset-x, 0px), var(--table-offset-y, 0px));
+  /* Without an explicit width (the "Auto" default), this flex item would otherwise grow to the
+     table's own natural content width — fine on a wide TV, but on a narrow phone that's wider
+     than the screen, and since the page never scrolls (overflow: hidden, see html/body above)
+     the overflow just gets silently clipped on both edges instead of wrapping. max-width caps it
+     to the space .slide__table-layout actually has; min-width: 0 overrides the flex default
+     (min-width: auto) that would otherwise refuse to shrink below the content's own preferred
+     width, which is what let it overflow in the first place. */
+  max-width: 100%;
+  min-width: 0;
 }
 .slide__table-wrap {
   width: 100%;
@@ -1190,6 +1255,10 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
   from { opacity: 0; transform: translateY(18px); }
   to { opacity: 1; transform: none; }
 }
+/* The title appears instantly with the rest of the slide instead of fading/rising in — the
+   eyebrow, description and button keep the entrance animation above. More specific than the
+   `> *` rule it overrides (an extra class), so source order doesn't matter here. */
+.slide.is-active .slide__content > .slide__title { animation: none; }
 
 /* ---------- Controls ---------- */
 .ctrl-arrow {
@@ -1300,6 +1369,11 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
   }
   /* Desktop offsets are ignored on phones so text never gets pushed off-screen. */
   .slide__content { transform: none; }
+  /* Same for the shared table's own nudge: dragged on a wide TV/desktop preview, that raw px
+     offset would otherwise carry over unchanged onto a much narrower phone and push the table
+     partly or fully off-screen. Its h/v alignment still positions it — only the extra nudge
+     on top of that is dropped. */
+  .slide__table-pos { transform: none; }
   /* Side gradients don't cover stacked mobile text — switch to a bottom-up wash. */
   .slide__overlay--left,
   .slide__overlay--right {
@@ -1311,7 +1385,12 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
   .slide__desc { max-width: 30ch; }
   .slide__btn { margin-top: 1.75rem; padding: 0.9rem 1.5rem; }
   .slide__table-layout { padding-left: 1rem; padding-right: 1rem; }
-  .slide__table td, .slide__table th { padding: 0.45rem 0.7rem; white-space: normal; }
+  /* word-break here (not just white-space: normal) matters for an unsized table: with several
+     columns on a narrow phone, even wrapping at spaces isn't enough once a single word/number
+     (e.g. a longer label, or the header text itself) is still wider than its column has room
+     for — without this it stays unbroken and forces the table wider than the screen, which then
+     just gets silently clipped by .slide__table-wrap's overflow: hidden above. */
+  .slide__table td, .slide__table th { padding: 0.45rem 0.7rem; white-space: normal; word-break: break-word; }
 
   /* Phones swipe; keep arrows small and out of the text's way. */
   .ctrl-arrow {

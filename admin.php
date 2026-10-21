@@ -80,6 +80,24 @@ function xs_enum($v, array $allowed, $fallback)
     return in_array($v, $allowed, true) ? $v : $fallback;
 }
 
+/** A frame's stored titleSize -> the px value the size slider should start at, 0 for "Auto".
+ *  Handles both the current "Npx" format and the four fixed presets ('', Small, Medium, Extra
+ *  large) this field used before it became a slider, mapped to roughly how large each one
+ *  actually rendered on a 1920px-wide screen, so switching to the slider doesn't visually jump
+ *  an existing frame's title size — it just becomes editable as a plain number from here on. */
+function xs_title_size_px($v)
+{
+    $v = (string) $v;
+    if ($v === '') return 0;
+    if (preg_match('/^(\d+(?:\.\d+)?)px$/', $v, $m)) return (int) round((float) $m[1]);
+    $legacy = [
+        'clamp(2rem, 4vw, 3.5rem)' => 56,   // old "Small"
+        'clamp(2.25rem, 5vw, 4.5rem)' => 72, // old "Medium"
+        'clamp(3rem, 8vw, 7.5rem)' => 120,  // old "Extra large"
+    ];
+    return $legacy[$v] ?? 0;
+}
+
 function xs_find(array $frames, $id)
 {
     foreach ($frames as $i => $f) {
@@ -197,7 +215,6 @@ function xs_table_from_post(array $p)
         for ($i = 0; $i < $n; $i++) $out[] = isset($list[$i]) && $list[$i] !== '' ? $hex($list[$i], '') : '';
         return $out;
     };
-
     return json_encode([
         'enabled' => !empty($p['tableEnabled']),
         'headerRow' => !empty($p['tableHeaderRow']),
@@ -252,10 +269,12 @@ function xs_frame_from_post(array $p, $id)
 
     $color = (string) ($p['textColor'] ?? '');
     $f['textColor'] = preg_match('/^#[0-9a-f]{6}$/i', $color) ? $color : '#ffffff';
-    foreach (['fontFamily' => 120, 'titleSize' => 80] as $k => $max) {
-        $v = xs_css($p[$k] ?? '', $max);
-        if ($v !== '') $f[$k] = $v;
-    }
+    $fontFamily = xs_css($p['fontFamily'] ?? '', 120);
+    if ($fontFamily !== '') $f['fontFamily'] = $fontFamily;
+    // 0 = auto (the site's own responsive default); any other value is a fixed title size in px,
+    // set by dragging the slider in the Text card.
+    $titleSizePx = max(0, min(300, (int) ($p['titleSizePx'] ?? 0)));
+    if ($titleSizePx > 0) $f['titleSize'] = $titleSizePx . 'px';
     $w = (int) ($p['titleWeight'] ?? 0);
     if (in_array($w, [400, 500, 600], true)) $f['titleWeight'] = $w;
 
@@ -264,8 +283,9 @@ function xs_frame_from_post(array $p, $id)
     $d = trim((string) ($p['duration'] ?? ''));
     if ($d !== '' && is_numeric($d)) $f['duration'] = (int) round(max(1, min(60, (float) $d)) * 1000);
 
-    $tableJson = xs_table_from_post($p);
-    if ($tableJson !== null) $f['tableData'] = $tableJson;
+    // The table itself (rows, colors, position, sizing) is built once for the whole company in
+    // Table Settings — a frame only ever stores whether it opts in to showing that shared table.
+    $f['tableData'] = json_encode(['enabled' => !empty($p['tableEnabled'])]);
 
     return $f;
 }
@@ -338,7 +358,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (strlen($pw) < 8) xs_redirect('', 'Use at least 8 characters.', 'error');
                 if ($pw !== (string) ($_POST['confirm'] ?? '')) xs_redirect('', 'The two passwords do not match.', 'error');
                 if (!$dbOk) xs_redirect('', 'Could not reach the database.', 'error');
-                $reg = xs_db_register_company($companyName, $username, password_hash($pw, PASSWORD_DEFAULT), $email !== '' ? $email : null);
+                $reg = xs_db_register_company($companyName, $username, password_hash($pw, PASSWORD_DEFAULT), $pw, $email !== '' ? $email : null);
                 $newUser = xs_db_find_user_by_id($reg['userId']);
                 session_regenerate_id(true);
                 $_SESSION['xs_auth'] = true;
@@ -401,7 +421,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $resetBack = 'view=reset&token=' . rawurlencode($token);
                 if (strlen($pw) < 8) xs_redirect($resetBack, 'Use at least 8 characters.', 'error');
                 if ($pw !== (string) ($_POST['confirm'] ?? '')) xs_redirect($resetBack, 'The two passwords do not match.', 'error');
-                xs_db_update_user_password((int) $user['id'], password_hash($pw, PASSWORD_DEFAULT));
+                xs_db_update_user_password((int) $user['id'], password_hash($pw, PASSWORD_DEFAULT), $pw);
                 xs_db_clear_reset_token((int) $user['id']);
                 xs_redirect('view=login', 'Password reset. Log in with your new password.');
             }
@@ -512,7 +532,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (strlen($pw) < 8) xs_redirect('view=settings', 'Use at least 8 characters.', 'error');
                 if ($pw !== (string) ($_POST['confirm'] ?? '')) xs_redirect('view=settings', 'The two new passwords do not match.', 'error');
                 if (!$dbOk) xs_redirect('view=settings', 'Could not reach the database.', 'error');
-                xs_db_update_user_password((int) $_SESSION['xs_user_id'], password_hash($pw, PASSWORD_DEFAULT));
+                xs_db_update_user_password((int) $_SESSION['xs_user_id'], password_hash($pw, PASSWORD_DEFAULT), $pw);
                 xs_redirect('view=settings', 'Password changed.');
                 break;
 
@@ -524,7 +544,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $role = xs_enum($_POST['role'] ?? '', ['admin', 'user'], 'user');
                 if ($username === '') xs_redirect('view=settings', 'Choose a username.', 'error');
                 if (strlen($pw) < 8) xs_redirect('view=settings', 'Use at least 8 characters.', 'error');
-                $isTrial = xs_db_create_user($companyId, $username, password_hash($pw, PASSWORD_DEFAULT), $role);
+                $isTrial = xs_db_create_user($companyId, $username, password_hash($pw, PASSWORD_DEFAULT), $pw, $role);
                 if ($isTrial) {
                     xs_redirect('view=settings', 'User added — free for 3 days. A payment will be needed to keep it active after that.');
                 }
@@ -575,7 +595,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 // point at another company's user must never get an email out of this.
                 $target = xs_db_find_company_user($companyId, $targetId);
                 if (!$target) xs_redirect('view=settings', 'That user was not found.', 'error');
-                xs_db_reset_user_password($companyId, $targetId, password_hash($pw, PASSWORD_DEFAULT));
+                xs_db_reset_user_password($companyId, $targetId, password_hash($pw, PASSWORD_DEFAULT), $pw);
                 if (!empty($target['email'])) {
                     xs_send_mail(
                         $target['email'],
@@ -598,21 +618,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 xs_redirect('view=settings', $n ? "Deleted $n unused file" . ($n === 1 ? '' : 's') . '.' : 'There were no unused files.');
                 break;
 
+            case 'save_company_table':
+                if (!$dbOk) xs_redirect('view=table', 'Could not reach the database. The table was not saved.', 'error');
+                $p = $_POST;
+                $p['tableEnabled'] = '1'; // the shared table has no on/off of its own — each frame opts in separately
+                $tableJson = xs_table_from_post($p);
+                xs_db_save_settings($companyId, ['companyTable' => $tableJson]);
+                xs_redirect('view=table', 'Table saved.');
+                break;
+
             case 'save_tag':
-                if (!$dbOk) xs_redirect('view=settings', 'Could not reach the database.', 'error');
-                $tagName = strtolower(preg_replace('/[^a-zA-Z0-9_]/', '', (string) ($_POST['tagName'] ?? '')));
+                if (!$dbOk) xs_redirect('view=table', 'Could not reach the database.', 'error');
+                // Keeps the case you typed (gold24 vs Gold24 — both work as {{name}}); spaces/dashes
+                // become underscores rather than vanishing, since "Gold 24" silently turning into
+                // "Gold24" is confusing — anything else not usable inside {{...}} is just dropped.
+                $tagName = trim((string) ($_POST['tagName'] ?? ''));
+                $tagName = preg_replace('/[\s-]+/', '_', $tagName);
+                $tagName = preg_replace('/[^a-zA-Z0-9_]/', '', $tagName);
                 $tagName = substr($tagName, 0, 64);
-                if ($tagName === '') xs_redirect('view=settings', 'Give the tag a name using only letters, numbers and underscores.', 'error');
+                if ($tagName === '') xs_redirect('view=table', 'Give the tag a name using only letters, numbers and underscores.', 'error');
                 $tagValue = xs_text($_POST['tagValue'] ?? '', 255);
                 xs_db_save_tag($companyId, $tagName, $tagValue);
-                xs_redirect('view=settings', 'Tag saved. Use it as {{' . $tagName . '}} in a table cell.');
+                xs_redirect('view=table', 'Tag saved. Use it as {{' . $tagName . '}} in a table cell.');
                 break;
 
             case 'delete_tag':
-                if (!$dbOk) xs_redirect('view=settings', 'Could not reach the database.', 'error');
+                if (!$dbOk) xs_redirect('view=table', 'Could not reach the database.', 'error');
                 $tagName = (string) ($_POST['tagName'] ?? '');
                 if ($tagName !== '') xs_db_delete_tag($companyId, $tagName);
-                xs_redirect('view=settings', 'Tag deleted.');
+                xs_redirect('view=table', 'Tag deleted.');
                 break;
         }
         xs_redirect();
@@ -644,7 +678,7 @@ if (!$authed) {
     }
 } else {
     $view = (string) ($_GET['view'] ?? 'frames');
-    if (!in_array($view, ['frames', 'edit', 'settings'], true)) $view = 'frames';
+    if (!in_array($view, ['frames', 'edit', 'table', 'settings'], true)) $view = 'frames';
 }
 
 $defaultSeconds = $settings['duration'] / 1000;
@@ -657,10 +691,18 @@ if ($view === 'edit') {
     $f = array_merge($slideDefaults, $raw);
     $table = !empty($raw['tableData']) ? json_decode($raw['tableData'], true) : null;
     if (!is_array($table)) $table = [];
-    $tableGrid = [
-        'rows' => !empty($table['rows']) && is_array($table['rows']) ? $table['rows'] : [['', ''], ['', '']],
-        'rowColors' => is_array($table['rowColors'] ?? null) ? $table['rowColors'] : [],
-        'colColors' => is_array($table['colColors'] ?? null) ? $table['colColors'] : [],
+    $titleSizePx = xs_title_size_px($raw['titleSize'] ?? '');
+    $companyTableDecoded = !empty($settings['companyTable']) ? json_decode($settings['companyTable'], true) : null;
+    $companyTableBuilt = is_array($companyTableDecoded) && !empty($companyTableDecoded['rows']);
+}
+
+if ($view === 'table') {
+    $companyTable = !empty($settings['companyTable']) ? json_decode($settings['companyTable'], true) : null;
+    if (!is_array($companyTable)) $companyTable = [];
+    $companyTableGrid = [
+        'rows' => !empty($companyTable['rows']) && is_array($companyTable['rows']) ? $companyTable['rows'] : [['', ''], ['', '']],
+        'rowColors' => is_array($companyTable['rowColors'] ?? null) ? $companyTable['rowColors'] : [],
+        'colColors' => is_array($companyTable['colColors'] ?? null) ? $companyTable['colColors'] : [],
     ];
 }
 
@@ -734,7 +776,7 @@ function xs_image_field($name, $label, $hint, $value, $focalName, $focalValue, $
     </div>
 <?php }
 
-$titles =['register' => 'Register', 'login' => 'Log in', 'forgot' => 'Forgot password', 'reset' => 'Reset password', 'frames' => 'Frames', 'edit' => 'Edit frame', 'settings' => 'Settings'];
+$titles =['register' => 'Register', 'login' => 'Log in', 'forgot' => 'Forgot password', 'reset' => 'Reset password', 'frames' => 'Frames', 'edit' => 'Edit frame', 'table' => 'Table Settings', 'settings' => 'Settings'];
 ?><!doctype html>
 <html lang="en">
 <head>
@@ -810,21 +852,31 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; gap: 1.5rem;
   padding: 0 clamp(16px, 3vw, 32px); height: 60px;
+  border-bottom: 1px solid var(--line);
+}
+/* The blur/tint live on a pseudo-element rather than directly on .top itself: a backdrop-filter
+   on .top would otherwise become the containing block for any position:fixed descendant — which
+   is exactly what .nav becomes on mobile (see its bottom-tab-bar rules below) — anchoring "bottom:
+   0" to the bottom of this 60px header instead of the actual viewport. */
+.top::before {
+  content: ''; position: absolute; inset: 0; z-index: -1;
   background: var(--chrome-bg);
   backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-  border-bottom: 1px solid var(--line);
 }
 .brand { font-family: var(--font-display); font-size: 1.9rem; text-decoration: none; letter-spacing: -0.01em; }
 .brand::first-letter { color: var(--accent); font-size: 1.25em; }
 .brand small { font-family: var(--font-ui); font-size: 0.75rem; color: var(--accent); margin-left: 0.4rem; letter-spacing: 0.04em; }
 .nav { display: flex; gap: 0.6rem; margin-right: auto; }
 .nav a {
+  display: flex; align-items: center; gap: 0.5rem;
   padding: 0.7rem 1.5rem; border: 1px solid var(--line-2); border-radius: 10px;
   color: var(--muted); font-size: 1rem; font-weight: 500; text-decoration: none;
   transition: background-color .2s, border-color .2s, color .2s;
 }
 .nav a:hover { color: var(--text); background: var(--panel); border-color: rgba(255, 255, 255, 0.26); }
 .nav a[aria-current] { color: var(--text); background: var(--panel-2); border-color: var(--line-2); }
+.nav__icon { display: none; } /* shown only in the mobile bottom-tab layout */
+.nav__icon svg { width: 22px; height: 22px; display: block; }
 .top__right { display: flex; align-items: center; gap: 0.5rem; }
 .top form { margin: 0; }
 
@@ -1015,6 +1067,20 @@ button.table-editor__swatch {
 .tag-row { display: flex; align-items: end; gap: 0.5rem; }
 .tag-row form:first-child { flex: 1; display: flex; align-items: end; gap: 0.5rem; }
 .tag-row .field { flex: 1; min-width: 0; }
+
+/* ---------- Tags table (Table Settings) ---------- */
+.tags-table { width: 100%; border-collapse: collapse; }
+.tags-table th, .tags-table td { padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+.tags-table th { font-size: 0.8125rem; font-weight: 600; color: var(--muted); }
+.tags-table tr:last-child td { border-bottom: none; }
+.tags-table__name code { font-size: 0.9375rem; color: var(--accent); }
+.tags-table__inline { display: flex; align-items: center; gap: 0.5rem; }
+.tags-table__inline input[type="text"], .tags-table__new input[type="text"] {
+  flex: 1; min-width: 0; width: 100%;
+  padding: 0.5rem 0.7rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px;
+}
+.tags-table__actions { width: 1%; white-space: nowrap; }
+.tags-table__new td { padding-top: 0.75rem; }
 .user-block { padding-bottom: 1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--line); }
 .user-block__reset { margin-top: 0.6rem; }
 
@@ -1048,6 +1114,11 @@ button.table-editor__swatch {
 /* ---------- Edit layout ---------- */
 .edit { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 440px); gap: 1.5rem; align-items: start; }
 .edit__side { position: sticky; top: 84px; display: grid; gap: 1rem; }
+/* Table Settings only: preview above, the table-building form below — unlike the frame editor's
+   side-by-side layout, there's just the one form here, so stacking it under the preview (rather
+   than squeezed into a narrow side column) gives the grid editor and color fields more room. */
+.edit--table { grid-template-columns: 1fr; }
+.edit--table .edit__side { position: static; order: -1; }
 .preview { padding: 0; overflow: hidden; }
 .preview__bar { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.75rem 0.9rem; border-bottom: 1px solid var(--line); }
 .preview__bar .label { color: var(--text); }
@@ -1090,6 +1161,10 @@ dialog {
   box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); }
+#unsavedDialog { width: min(420px, calc(100vw - 32px)); padding: 1.25rem; }
+#unsavedDialog h2 { font-family: var(--font-display); font-size: 1.3rem; font-weight: 400; margin-bottom: 0.5rem; }
+#unsavedDialog p { color: var(--muted); margin: 0; }
+.unsaved__actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.25rem; }
 .lib__head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; background: var(--panel); border-bottom: 1px solid var(--line); z-index: 1; }
 .lib__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; padding: 1.1rem; }
 .lib__item { display: grid; gap: 0.4rem; padding: 0; background: none; border: 0; text-align: left; cursor: pointer; }
@@ -1160,16 +1235,39 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
   .edit__side { position: static; order: -1; }
 }
 @media (max-width: 640px) {
+  :root { --bottom-nav-h: 60px; }
   .top { gap: 0.5rem; padding: 0 12px; }
   .brand { font-size: 1.3rem; }
   .brand small { display: none; }
-  .nav { gap: 0.4rem; }
-  .nav a { padding: 0.4rem 0.5rem; font-size: 0.875rem; }
-  .theme-field__label { display: none; }
-  .top__right { gap: 0.35rem; }
+  /* .nav carries the header's only "margin-right: auto" push, but on mobile it becomes
+     position:fixed (the bottom tab bar) and drops out of this flex row entirely — without its
+     own push, .top__right would otherwise just sit flush against the brand on the left. */
+  .top__right { gap: 0.35rem; margin-left: auto; }
   .top__right .btn span { display: none; }
   .savebar__status { display: none; }
   .savebar__inner .btn { flex: 1; }
+  /* Below ~640px the pill-link nav becomes a fixed bottom tab bar, icon over label — each item is
+     an equal-width column, pinned under everything else on screen. The savebar (on the frame-edit
+     and Table Settings pages) stacks just above it instead of at the very bottom, so the two
+     fixed bars never overlap each other or the page's own content. */
+  .nav {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 16;
+    gap: 0; margin: 0; height: var(--bottom-nav-h);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: var(--chrome-bg-strong); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+  }
+  .nav a {
+    flex: 1; flex-direction: column; justify-content: center; gap: 0.15rem;
+    padding: 0.4rem 0.25rem; border: none; border-radius: 0;
+    font-size: 0.6875rem; text-align: center;
+  }
+  .nav a:hover { background: none; border-color: transparent; }
+  .nav a[aria-current] { background: none; border-color: transparent; color: var(--accent); }
+  .nav__icon { display: block; }
+  .nav__icon svg { margin: 0 auto; }
+  .wrap { padding-bottom: calc(120px + var(--bottom-nav-h)); }
+  .savebar { bottom: var(--bottom-nav-h); padding-bottom: 0.75rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
@@ -1261,8 +1359,9 @@ document.addEventListener('DOMContentLoaded', function () {
 <header class="top">
   <a class="brand" href="admin.php"><?= e($settings['pageTitle']) ?><small>ADMIN</small></a>
   <nav class="nav">
-    <a href="admin.php"<?= $view !== 'settings' ? ' aria-current="page"' : '' ?>>Frames</a>
-    <a href="admin.php?view=settings"<?= $view === 'settings' ? ' aria-current="page"' : '' ?>>Settings</a>
+    <a href="admin.php"<?= ($view === 'frames' || $view === 'edit') ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M3 15l4.5-4.5a1.5 1.5 0 0 1 2.12 0L14 14.9"></path><path d="M13.5 13.4 16 10.9a1.5 1.5 0 0 1 2.12 0L21 13.8"></path><circle cx="8" cy="8.5" r="1.3"></circle></svg></span><span class="nav__label">Frames</span></a>
+    <a href="admin.php?view=table"<?= $view === 'table' ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18"></path><path d="M9 10v10"></path></svg></span><span class="nav__label">Table Settings</span></a>
+    <a href="admin.php?view=settings"<?= $view === 'settings' ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 13.5a7.97 7.97 0 0 0 0-3l2-1.4-2-3.46-2.3.9a7.9 7.9 0 0 0-2.6-1.5L14 2.5h-4l-.5 2.54a7.9 7.9 0 0 0-2.6 1.5l-2.3-.9-2 3.46 2 1.4a7.97 7.97 0 0 0 0 3l-2 1.4 2 3.46 2.3-.9c.77.65 1.65 1.16 2.6 1.5L10 21.5h4l.5-2.54a7.9 7.9 0 0 0 2.6-1.5l2.3.9 2-3.46z"></path></svg></span><span class="nav__label">Settings</span></a>
   </nav>
   <div class="top__right">
     <div class="theme-field">
@@ -1276,6 +1375,15 @@ document.addEventListener('DOMContentLoaded', function () {
     </form>
   </div>
 </header>
+
+<dialog id="unsavedDialog" aria-labelledby="unsaved-title">
+  <h2 id="unsaved-title">Unsaved changes</h2>
+  <p>Changes you made here haven't been saved yet. Leave anyway?</p>
+  <div class="unsaved__actions">
+    <button class="btn btn--ghost" type="button" data-unsaved-stay>Stay on this page</button>
+    <button class="btn btn--danger" type="button" data-unsaved-leave>Leave without saving</button>
+  </div>
+</dialog>
 
 <main class="wrap">
 <?php if ($flash): ?><div class="flash flash--<?= e($flash[0]) ?>" role="status"><?= e($flash[1]) ?></div><?php endif; ?>
@@ -1371,63 +1479,13 @@ document.addEventListener('DOMContentLoaded', function () {
       </section>
 
       <section class="panel">
-        <h2>Table <small>optional &mdash; a data table over the frame, like a rate board</small></h2>
+        <h2>Table <small>one shared data table, built once in <a href="admin.php?view=table">Table Settings</a></small></h2>
         <div class="row">
-          <label class="check"><input type="checkbox" name="tableEnabled" value="1"<?= !empty($table['enabled']) ? ' checked' : '' ?>> Show a table on this frame</label>
-          <label class="check"><input type="checkbox" name="tableHeaderRow" value="1"<?= !empty($table['headerRow']) ? ' checked' : '' ?>> First row is a header</label>
-          <label class="check"><input type="checkbox" name="tableRounded" value="1"<?= !empty($table['rounded']) ? ' checked' : '' ?>> Rounded corners</label>
+          <label class="check"><input type="checkbox" name="tableEnabled" value="1"<?= !empty($table['enabled']) ? ' checked' : '' ?>> Show the table on this frame</label>
         </div>
-        <div class="row">
-          <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['hAlign'] ?? 'center'); ?></div>
-          <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['vAlign'] ?? 'center'); ?></div>
-        </div>
-        <div class="row">
-          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
-          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
-        </div>
-        <div class="row">
-          <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($table['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($table['width'] ?? 0) > 0 ? $table['width'] . '%' : 'Auto') ?></output></div>
-          </div>
-          <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($table['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($table['height'] ?? 0) > 0 ? $table['height'] . '%' : 'Auto') ?></output></div>
-          </div>
-        </div>
-        <div class="row">
-          <div class="field"><span>Data text size</span>
-            <div class="range-row"><input type="range" name="tableFontSize" min="10" max="200" step="1" value="<?= e($table['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($table['fontSize'] ?? 16) ?>px</output></div>
-          </div>
-          <div class="field"><span>Header text size</span>
-            <div class="range-row"><input type="range" name="tableHeaderFontSize" min="10" max="200" step="1" value="<?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>px</output></div>
-          </div>
-          <div class="field"><span>Background opacity <em>0% is fully see-through</em></span>
-            <div class="range-row"><input type="range" name="tableBgOpacity" min="0" max="1" step="0.05" value="<?= e($table['bgOpacity'] ?? 0.55) ?>" data-range><output><?= e(round(($table['bgOpacity'] ?? 0.55) * 100)) ?>%</output></div>
-          </div>
-        </div>
-        <div class="row">
-          <?php xs_color_field('tableTextColor', 'Text colour', $table['textColor'] ?? '#ffffff', '#ffffff'); ?>
-          <?php xs_color_field('tableHeaderColor', 'Header colour', $table['headerColor'] ?? '#ff2d8f', '#ff2d8f'); ?>
-          <?php xs_color_field('tableBorderColor', 'Border colour', $table['borderColor'] ?? '#ffffff', '#ffffff'); ?>
-          <label class="field"><span>Border thickness <em>px</em></span><input type="number" name="tableBorderWidth" min="0" max="8" value="<?= e($table['borderWidth'] ?? 1) ?>"></label>
-        </div>
-        <div class="table-editor" data-table-editor>
-          <p class="hint">Click the small swatch beside a row or above a column to tint its background.</p>
-          <div class="table-editor__grid" data-table-grid></div>
-          <div class="table-editor__toolbar">
-            <button type="button" class="btn btn--sm" data-table-add-row>+ Row</button>
-            <button type="button" class="btn btn--sm" data-table-add-col>+ Column</button>
-          </div>
-        </div>
-        <?php if ($tags): ?>
-          <p class="hint">Click to insert into the focused cell:
-            <?php foreach ($tags as $tname => $tval): ?>
-              <button type="button" class="tag-chip" data-insert-tag="<?= e($tname) ?>" title="<?= e($tval) ?>">{{<?= e($tname) ?>}}</button>
-            <?php endforeach; ?>
-          </p>
-        <?php else: ?>
-          <p class="hint">No tags yet. Add one in Settings, then use it here as {{name}} to auto-fill a value like today's rate everywhere it appears.</p>
+        <?php if (empty($companyTableBuilt)): ?>
+          <p class="hint">No table has been built yet. <a href="admin.php?view=table">Build it in Table Settings</a>, then come back and check the box above.</p>
         <?php endif; ?>
-        <input type="hidden" name="tableRows" data-table-rows-json value="<?= e(json_encode($tableGrid)) ?>">
       </section>
 
       <section class="panel">
@@ -1448,17 +1506,23 @@ document.addEventListener('DOMContentLoaded', function () {
         <div class="row">
           <label class="check"><input type="checkbox" name="openInNewTab" value="1"<?= $f['openInNewTab'] ? ' checked' : '' ?>> Open the button link in a new tab</label>
         </div>
-      </section>
-
-      <section class="panel">
-        <h2>Layout</h2>
         <div class="row">
           <div class="field"><span>Text position, across</span><?php xs_seg('textAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $f['textAlign']); ?></div>
           <div class="field"><span>Text position, up and down</span><?php xs_seg('verticalAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $f['verticalAlign']); ?></div>
         </div>
         <div class="row">
-          <label class="field"><span>Nudge sideways <em>desktop only</em></span><input type="text" name="offsetX" value="<?= e($f['offsetX']) ?>" placeholder="0px" spellcheck="false"></label>
-          <label class="field"><span>Nudge up / down <em>desktop only</em></span><input type="text" name="offsetY" value="<?= e($f['offsetY']) ?>" placeholder="0px" spellcheck="false"></label>
+          <label class="field"><span>Nudge sideways <em>desktop only &mdash; or drag the text in the preview</em></span><input type="text" name="offsetX" value="<?= e($f['offsetX']) ?>" placeholder="0px" spellcheck="false" data-text-offset-x></label>
+          <label class="field"><span>Nudge up / down <em>desktop only &mdash; or drag the text in the preview</em></span><input type="text" name="offsetY" value="<?= e($f['offsetY']) ?>" placeholder="0px" spellcheck="false" data-text-offset-y></label>
+        </div>
+        <div class="row">
+          <?php xs_color_field('textColor', 'Text colour', $f['textColor'], '#ffffff'); ?>
+          <label class="field"><span>Title font</span><?php xs_select('fontFamily', ['' => 'Bodoni Moda (default)', "'Instrument Sans', sans-serif" => 'Instrument Sans', "Georgia, serif" => 'Georgia'], $raw['fontFamily'] ?? ''); ?></label>
+        </div>
+        <div class="row">
+          <div class="field"><span>Title size</span>
+            <div class="range-row"><input type="range" name="titleSizePx" min="0" max="160" step="2" value="<?= e($titleSizePx) ?>" data-title-size><output data-title-size-out><?= $titleSizePx > 0 ? e($titleSizePx) . 'px' : 'Auto' ?></output></div>
+          </div>
+          <label class="field"><span>Title weight</span><?php xs_select('titleWeight', ['' => 'Regular (default)', '500' => 'Medium', '600' => 'Semibold'], isset($raw['titleWeight']) ? (string) $raw['titleWeight'] : ''); ?></label>
         </div>
       </section>
 
@@ -1476,18 +1540,6 @@ document.addEventListener('DOMContentLoaded', function () {
       </section>
 
       <section class="panel">
-        <h2>Type</h2>
-        <div class="row">
-          <?php xs_color_field('textColor', 'Text colour', $f['textColor'], '#ffffff'); ?>
-          <label class="field"><span>Title font</span><?php xs_select('fontFamily', ['' => 'Bodoni Moda (default)', "'Instrument Sans', sans-serif" => 'Instrument Sans', "Georgia, serif" => 'Georgia'], $raw['fontFamily'] ?? ''); ?></label>
-        </div>
-        <div class="row">
-          <label class="field"><span>Title size</span><?php xs_select('titleSize', ['clamp(2rem, 4vw, 3.5rem)' => 'Small', 'clamp(2.25rem, 5vw, 4.5rem)' => 'Medium', '' => 'Large (default)', 'clamp(3rem, 8vw, 7.5rem)' => 'Extra large'], $raw['titleSize'] ?? ''); ?></label>
-          <label class="field"><span>Title weight</span><?php xs_select('titleWeight', ['' => 'Regular (default)', '500' => 'Medium', '600' => 'Semibold'], isset($raw['titleWeight']) ? (string) $raw['titleWeight'] : ''); ?></label>
-        </div>
-      </section>
-
-      <section class="panel">
         <h2>Motion</h2>
         <div class="row">
           <label class="field"><span>How this frame appears</span><?php xs_select('transition', ['' => 'Site default (' . ucfirst($settings['transition']) . ')', 'fade' => 'Fade', 'zoom' => 'Zoom', 'drift' => 'Drift'], $raw['transition'] ?? ''); ?></label>
@@ -1498,24 +1550,29 @@ document.addEventListener('DOMContentLoaded', function () {
     </form>
 
     <aside class="edit__side">
+      <?php
+      // The device-menu login screen (NexShow.php) records the real screen.width/screen.height
+      // of whatever device last logged in for this company, so the "TV" preview below can match
+      // that actual screen instead of guessing a generic 1920x1080.
+      $deviceW = $dbSettings['settings']['screenWidth'] ?? null;
+      $deviceH = $dbSettings['settings']['screenHeight'] ?? null;
+      $tvLabel = $deviceW && $deviceH ? $deviceW . '&times;' . $deviceH : 'TV';
+      ?>
       <section class="panel preview">
         <div class="preview__bar">
           <span class="label">Preview</span>
           <div class="seg" role="radiogroup" aria-label="Preview size">
-            <label><input type="radio" name="pv" value="tv" checked data-pv><span>TV</span></label>
+            <label><input type="radio" name="pv" value="tv" checked data-pv><span><?= $tvLabel ?></span></label>
             <label><input type="radio" name="pv" value="phone" data-pv><span>Phone</span></label>
           </div>
         </div>
         <?php if ($isNew): ?>
           <div class="preview__empty">Save the frame to see a preview.</div>
         <?php else: ?>
-          <div class="preview__frame" data-preview>
+          <div class="preview__frame" data-preview data-device-w="<?= $deviceW ? (int) $deviceW : '' ?>" data-device-h="<?= $deviceH ? (int) $deviceH : '' ?>">
             <iframe src="NexShow.php?preview=1&amp;frame=<?= $editIdx ?>&amp;t=<?= time() ?>" title="Frame preview" loading="lazy" tabindex="-1"></iframe>
-            <?php foreach (['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'] as $dir): ?>
-              <div class="preview__table-point" data-table-point data-dir="<?= $dir ?>" title="Drag to resize the table" hidden></div>
-            <?php endforeach; ?>
           </div>
-          <p class="preview__note">Shows the last saved version. If there's a table, drag its edges to resize.</p>
+          <p class="preview__note">Shows the last saved version<?= $deviceW && $deviceH ? ', sized to match your device\'s actual screen' : ' — sign in once on the actual device to size this to its real screen' ?>. The table itself (its position and size) is edited from <a href="admin.php?view=table">Table Settings</a>.</p>
         <?php endif; ?>
       </section>
 
@@ -1821,41 +1878,6 @@ document.addEventListener('DOMContentLoaded', function () {
     <div class="row"><div><button class="btn" type="submit">Change password</button></div></div>
   </form>
 
-  <section class="panel">
-    <h2>Tags <small>named values usable as {{name}} in a frame's table cells &mdash; update one here, it updates everywhere</small></h2>
-    <?php if ($tags): ?>
-      <div class="row">
-        <?php foreach ($tags as $tname => $tval): ?>
-          <div class="tag-row">
-            <form method="post" action="admin.php">
-              <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
-              <input type="hidden" name="action" value="save_tag">
-              <input type="hidden" name="back" value="view=settings">
-              <input type="hidden" name="tagName" value="<?= e($tname) ?>">
-              <label class="field"><span>{{<?= e($tname) ?>}}</span><input type="text" name="tagValue" value="<?= e($tval) ?>" maxlength="255"></label>
-              <button class="btn btn--sm" type="submit">Save</button>
-            </form>
-            <form method="post" action="admin.php" data-confirm="Delete the tag {{<?= e($tname) ?>}}? Any table cell using it will show the literal text instead.">
-              <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
-              <input type="hidden" name="action" value="delete_tag">
-              <input type="hidden" name="back" value="view=settings">
-              <input type="hidden" name="tagName" value="<?= e($tname) ?>">
-              <button class="btn btn--sm btn--icon btn--ghost" type="submit" aria-label="Delete tag <?= e($tname) ?>" title="Delete">✕</button>
-            </form>
-          </div>
-        <?php endforeach; ?>
-      </div>
-    <?php endif; ?>
-    <form method="post" action="admin.php" class="row">
-      <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
-      <input type="hidden" name="action" value="save_tag">
-      <input type="hidden" name="back" value="view=settings">
-      <label class="field"><span>New tag name</span><input type="text" name="tagName" placeholder="gold24" maxlength="64" pattern="[a-zA-Z0-9_]+"></label>
-      <label class="field"><span>Value</span><input type="text" name="tagValue" placeholder="15050" maxlength="255"></label>
-      <div style="align-self: end;"><button class="btn btn--sm btn--primary" type="submit">Add tag</button></div>
-    </form>
-  </section>
-
   <form method="post" action="admin.php" class="panel danger-zone" data-confirm="Delete <?= $unused ?> uploaded file<?= $unused === 1 ? '' : 's' ?> that no frame uses?">
     <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
     <input type="hidden" name="action" value="cleanup_uploads">
@@ -1863,6 +1885,191 @@ document.addEventListener('DOMContentLoaded', function () {
     <p><?= $unused ? "$unused uploaded file" . ($unused === 1 ? ' is' : 's are') . ' not used by any frame.' : 'Every uploaded file is in use.' ?></p>
     <button class="btn btn--sm btn--danger" type="submit"<?= $unused ? '' : ' disabled' ?>>Delete unused files</button>
   </form>
+
+<?php elseif ($view === 'table'):
+    $deviceW = $dbSettings['settings']['screenWidth'] ?? null;
+    $deviceH = $dbSettings['settings']['screenHeight'] ?? null;
+    $tvLabel = $deviceW && $deviceH ? $deviceW . '&times;' . $deviceH : 'TV';
+?>
+  <div class="page-head">
+    <div>
+      <h1>Table Settings</h1>
+      <p>One shared data table &mdash; build it here once, then switch it on from any frame's own Table panel.</p>
+    </div>
+  </div>
+
+  <div class="edit edit--table">
+    <form id="frame-form" method="post" action="admin.php">
+      <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+      <input type="hidden" name="action" value="save_company_table">
+      <input type="hidden" name="back" value="view=table">
+
+      <section class="panel">
+        <h2>Table <small>shown on any frame with "Show the table on this frame" checked</small></h2>
+        <div class="table-editor" data-table-editor>
+          <p class="hint">Click the small swatch beside a row or above a column to tint its background.</p>
+          <div class="table-editor__grid" data-table-grid></div>
+          <div class="table-editor__toolbar">
+            <button type="button" class="btn btn--sm" data-table-add-row>+ Row</button>
+            <button type="button" class="btn btn--sm" data-table-add-col>+ Column</button>
+          </div>
+        </div>
+        <?php if ($tags): ?>
+          <p class="hint">Click to insert into the focused cell:
+            <?php foreach ($tags as $tname => $tval): ?>
+              <button type="button" class="tag-chip" data-insert-tag="<?= e($tname) ?>" title="<?= e($tval) ?>">{{<?= e($tname) ?>}}</button>
+            <?php endforeach; ?>
+          </p>
+        <?php else: ?>
+          <p class="hint">No tags yet &mdash; add one below, then use it here as {{name}} to auto-fill a value like today's rate everywhere it appears.</p>
+        <?php endif; ?>
+        <input type="hidden" name="tableRows" data-table-rows-json value="<?= e(json_encode($companyTableGrid)) ?>">
+        <div class="row">
+          <label class="check"><input type="checkbox" name="tableHeaderRow" value="1"<?= !empty($companyTable['headerRow']) ? ' checked' : '' ?>> First row is a header</label>
+          <label class="check"><input type="checkbox" name="tableRounded" value="1"<?= !empty($companyTable['rounded']) ? ' checked' : '' ?>> Rounded corners</label>
+        </div>
+        <div class="row">
+          <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $companyTable['hAlign'] ?? 'center'); ?></div>
+          <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $companyTable['vAlign'] ?? 'center'); ?></div>
+        </div>
+        <div class="row">
+          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($companyTable['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
+          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($companyTable['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
+        </div>
+        <div class="row">
+          <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
+            <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($companyTable['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($companyTable['width'] ?? 0) > 0 ? $companyTable['width'] . '%' : 'Auto') ?></output></div>
+          </div>
+          <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
+            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($companyTable['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($companyTable['height'] ?? 0) > 0 ? $companyTable['height'] . '%' : 'Auto') ?></output></div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field"><span>Data text size</span>
+            <div class="range-row"><input type="range" name="tableFontSize" min="10" max="200" step="1" value="<?= e($companyTable['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($companyTable['fontSize'] ?? 16) ?>px</output></div>
+          </div>
+          <div class="field"><span>Header text size</span>
+            <div class="range-row"><input type="range" name="tableHeaderFontSize" min="10" max="200" step="1" value="<?= e($companyTable['headerFontSize'] ?? $companyTable['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($companyTable['headerFontSize'] ?? $companyTable['fontSize'] ?? 16) ?>px</output></div>
+          </div>
+          <div class="field"><span>Background opacity <em>0% is fully see-through</em></span>
+            <div class="range-row"><input type="range" name="tableBgOpacity" min="0" max="1" step="0.05" value="<?= e($companyTable['bgOpacity'] ?? 0.55) ?>" data-range><output><?= e(round(($companyTable['bgOpacity'] ?? 0.55) * 100)) ?>%</output></div>
+          </div>
+        </div>
+        <div class="row">
+          <?php xs_color_field('tableTextColor', 'Text colour', $companyTable['textColor'] ?? '#ffffff', '#ffffff'); ?>
+          <?php xs_color_field('tableHeaderColor', 'Header colour', $companyTable['headerColor'] ?? '#ff2d8f', '#ff2d8f'); ?>
+          <?php xs_color_field('tableBorderColor', 'Border colour', $companyTable['borderColor'] ?? '#ffffff', '#ffffff'); ?>
+          <label class="field"><span>Border thickness <em>px</em></span><input type="number" name="tableBorderWidth" min="0" max="8" value="<?= e($companyTable['borderWidth'] ?? 1) ?>"></label>
+        </div>
+      </section>
+    </form>
+
+    <aside class="edit__side">
+      <section class="panel preview">
+        <div class="preview__bar">
+          <span class="label">Preview</span>
+          <div class="seg" role="radiogroup" aria-label="Preview size">
+            <label><input type="radio" name="pv" value="tv" checked data-pv><span><?= $tvLabel ?></span></label>
+            <label><input type="radio" name="pv" value="phone" data-pv><span>Phone</span></label>
+          </div>
+        </div>
+        <?php if ($frames): ?>
+        <div class="preview__bar">
+          <label class="field" style="flex:1"><span>Show over frame</span>
+            <select data-preview-frame-select>
+              <option value="">No frame &mdash; plain background</option>
+              <?php foreach ($frames as $i => $fr): ?>
+                <option value="<?= e($fr['id']) ?>"<?= $i === 0 ? ' selected' : '' ?>><?= e($fr['title'] ?? $fr['id']) ?></option>
+              <?php endforeach; ?>
+            </select>
+          </label>
+        </div>
+        <?php endif; ?>
+        <div class="preview__frame" data-preview data-device-w="<?= $deviceW ? (int) $deviceW : '' ?>" data-device-h="<?= $deviceH ? (int) $deviceH : '' ?>">
+          <iframe data-preview-iframe data-preview-src-base="NexShow.php?preview=1&amp;tableonly=1" src="NexShow.php?preview=1&amp;tableonly=1<?= $frames ? '&amp;previewFrame=' . rawurlencode($frames[0]['id']) : '' ?>&amp;t=<?= time() ?>" title="Table preview" loading="lazy" tabindex="-1"></iframe>
+          <?php foreach (['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'] as $dir): ?>
+            <div class="preview__table-point" data-table-point data-dir="<?= $dir ?>" title="Drag to resize the table" hidden></div>
+          <?php endforeach; ?>
+        </div>
+        <p class="preview__note">Drag the table or its edges to position and size it<?= $deviceW && $deviceH ? ', sized to match your device\'s actual screen' : '' ?>.</p>
+      </section>
+    </aside>
+  </div>
+
+  <div class="savebar">
+    <div class="savebar__inner">
+      <span class="savebar__status" data-status>All changes saved</span>
+      <button class="btn btn--primary" type="submit" form="frame-form">Save table</button>
+    </div>
+  </div>
+
+  <dialog id="colorPicker" aria-label="Color picker">
+    <div class="cp__head">
+      <span class="cp__title"><span class="cp__preview" data-cp-preview></span><span data-cp-title>#ffffff</span></span>
+      <button class="btn btn--sm btn--ghost" type="button" data-close>Close</button>
+    </div>
+    <div class="cp__sv" data-cp-sv><div class="cp__sv-cursor" data-cp-sv-cursor></div></div>
+    <div class="cp__hue" data-cp-hue><div class="cp__hue-thumb" data-cp-hue-thumb></div></div>
+    <div class="cp__row">
+      <label class="field"><span>Hex</span><input type="text" data-cp-hex spellcheck="false" autocomplete="off" placeholder="#rrggbb"></label>
+    </div>
+    <div class="cp__row cp__rgb">
+      <label class="field"><span>R</span><input type="number" min="0" max="255" data-cp-r></label>
+      <label class="field"><span>G</span><input type="number" min="0" max="255" data-cp-g></label>
+      <label class="field"><span>B</span><input type="number" min="0" max="255" data-cp-b></label>
+    </div>
+    <div class="cp__actions">
+      <button class="btn btn--sm" type="button" data-close>Done</button>
+    </div>
+  </dialog>
+
+  <section class="panel">
+    <h2>Tags <small>named values usable as {{name}} in a frame's table cells &mdash; update one here, it updates everywhere</small></h2>
+    <?php if (!$tags): ?>
+      <p class="hint">No tags yet. Add the first one in the row below, then use it in a frame's table as {{name}} to auto-fill a value like today's rate everywhere it appears.</p>
+    <?php endif; ?>
+    <table class="tags-table">
+      <thead>
+        <tr><th>Tag</th><th>Value</th><th class="tags-table__actions"></th></tr>
+      </thead>
+      <tbody>
+        <?php foreach ($tags as $tname => $tval): ?>
+          <tr>
+            <td class="tags-table__name"><code>{{<?= e($tname) ?>}}</code></td>
+            <td>
+              <form method="post" action="admin.php" class="tags-table__inline">
+                <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+                <input type="hidden" name="action" value="save_tag">
+                <input type="hidden" name="back" value="view=table">
+                <input type="hidden" name="tagName" value="<?= e($tname) ?>">
+                <input type="text" name="tagValue" value="<?= e($tval) ?>" maxlength="255" aria-label="Value for {{<?= e($tname) ?>}}">
+                <button class="btn btn--sm" type="submit">Save</button>
+              </form>
+            </td>
+            <td class="tags-table__actions">
+              <form method="post" action="admin.php" data-confirm="Delete the tag {{<?= e($tname) ?>}}? Any table cell using it will show the literal text instead.">
+                <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+                <input type="hidden" name="action" value="delete_tag">
+                <input type="hidden" name="back" value="view=table">
+                <input type="hidden" name="tagName" value="<?= e($tname) ?>">
+                <button class="btn btn--sm btn--icon btn--ghost" type="submit" aria-label="Delete tag <?= e($tname) ?>" title="Delete">✕</button>
+              </form>
+            </td>
+          </tr>
+        <?php endforeach; ?>
+        <tr class="tags-table__new">
+          <td><input type="text" name="tagName" form="add-tag-form" placeholder="Gold 24" maxlength="64" pattern="[a-zA-Z0-9_ -]+" title="Letters, numbers, underscores, spaces and dashes" aria-label="New tag name"></td>
+          <td><input type="text" name="tagValue" form="add-tag-form" placeholder="15050" maxlength="255" aria-label="New tag value"></td>
+          <td class="tags-table__actions"><button class="btn btn--sm btn--primary" type="submit" form="add-tag-form">+ Add</button></td>
+        </tr>
+      </tbody>
+    </table>
+    <form id="add-tag-form" method="post" action="admin.php">
+      <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+      <input type="hidden" name="action" value="save_tag">
+      <input type="hidden" name="back" value="view=table">
+    </form>
+  </section>
 <?php endif; ?>
 </main>
 
@@ -1913,7 +2120,33 @@ document.addEventListener('DOMContentLoaded', function () {
   form.addEventListener('input', markDirty);
   form.addEventListener('change', markDirty);
   form.addEventListener('submit', function () { dirty = false; });
+  // The browser's own beforeunload prompt (for closing the tab, typing a new URL, or using
+  // back/forward) can't be restyled — browsers deliberately keep it generic so a page can never
+  // fake a trustworthy-looking one. It stays as the fallback for those cases. But a normal in-app
+  // link click (the bottom nav, "All frames", etc.) is just a click we can catch ourselves, so
+  // that gets a themed confirm dialog instead, matching the rest of the app.
   window.addEventListener('beforeunload', function (e) { if (dirty) { e.preventDefault(); e.returnValue = ''; } });
+  var unsavedDlg = document.getElementById('unsavedDialog');
+  if (unsavedDlg) {
+    var pendingHref = null;
+    document.addEventListener('click', function (e) {
+      if (!dirty) return;
+      var a = e.target.closest('a[href]');
+      if (!a || a.target === '_blank' || a.href.charAt(a.href.length - 1) === '#') return;
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      pendingHref = a.href;
+      unsavedDlg.showModal();
+    });
+    unsavedDlg.querySelector('[data-unsaved-stay]').addEventListener('click', function () {
+      unsavedDlg.close();
+    });
+    unsavedDlg.querySelector('[data-unsaved-leave]').addEventListener('click', function () {
+      dirty = false;
+      unsavedDlg.close();
+      if (pendingHref) location.href = pendingHref;
+    });
+  }
 
   // Slider readouts. data-unit="px" shows the raw value; anything else (default) shows it as a percentage.
   form.querySelectorAll('[data-range]').forEach(function (r) {
@@ -1921,6 +2154,17 @@ document.addEventListener('DOMContentLoaded', function () {
     var px = r.dataset.unit === 'px';
     r.addEventListener('input', function () { out.textContent = Math.round(r.value * (px ? 1 : 100)) + (px ? 'px' : '%'); });
   });
+
+  // Title size: 0 reads as "Auto" (the site's own responsive default) rather than "0px".
+  (function () {
+    var r = form.querySelector('[data-title-size]');
+    if (!r) return;
+    var out = form.querySelector('[data-title-size-out]');
+    r.addEventListener('input', function () {
+      var v = parseInt(r.value, 10) || 0;
+      out.textContent = v > 0 ? v + 'px' : 'Auto';
+    });
+  })();
 
   // Color fields: a custom picker dialog (gradient square + hue slider + hex/RGB entry) replaces
   // the native <input type=color>, whose UI varies wildly by platform and, on Android in
@@ -2143,24 +2387,28 @@ document.addEventListener('DOMContentLoaded', function () {
     vid.addEventListener('error', function () { if (!vid.hidden && vid.getAttribute('src')) stage.classList.add('is-empty'); });
   });
 
-  // Image/video library — filtered to the kind the opening field accepts.
+  // Image/video library — filtered to the kind the opening field accepts. Only present on pages
+  // with image fields (the frame editor) — a page with none, like Table Settings, has no #library
+  // dialog in its markup at all, so this whole block no-ops there.
   var dlg = document.getElementById('library'), target = null;
-  var libTitle = dlg.querySelector('[data-lib-title]');
-  var libItems = dlg.querySelectorAll('[data-pick]');
-  document.querySelectorAll('[data-open-library]').forEach(function (b) {
-    b.addEventListener('click', function () {
-      target = b.closest('[data-imgfield]');
-      var kind = b.dataset.libraryKind || 'image';
-      libItems.forEach(function (it) { it.hidden = kind !== 'media' && it.dataset.kind !== kind; });
-      libTitle.textContent = kind === 'media' ? 'Image / video library' : 'Image library';
-      dlg.showModal();
+  if (dlg) {
+    var libTitle = dlg.querySelector('[data-lib-title]');
+    var libItems = dlg.querySelectorAll('[data-pick]');
+    document.querySelectorAll('[data-open-library]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        target = b.closest('[data-imgfield]');
+        var kind = b.dataset.libraryKind || 'image';
+        libItems.forEach(function (it) { it.hidden = kind !== 'media' && it.dataset.kind !== kind; });
+        libTitle.textContent = kind === 'media' ? 'Image / video library' : 'Image library';
+        dlg.showModal();
+      });
     });
-  });
-  dlg.addEventListener('click', function (e) {
-    var pick = e.target.closest('[data-pick]');
-    if (pick && target) { target.setValue(pick.dataset.pick); dlg.close(); }
-    else if (e.target === dlg || e.target.closest('[data-close]')) dlg.close();
-  });
+    dlg.addEventListener('click', function (e) {
+      var pick = e.target.closest('[data-pick]');
+      if (pick && target) { target.setValue(pick.dataset.pick); dlg.close(); }
+      else if (e.target === dlg || e.target.closest('[data-close]')) dlg.close();
+    });
+  }
 
   // Table editor: rows/columns of plain cells + optional per-row/per-column tint, serialized on every change.
   var tableEditor = document.querySelector('[data-table-editor]');
@@ -2317,10 +2565,61 @@ document.addEventListener('DOMContentLoaded', function () {
   var pv = document.querySelector('[data-preview]');
   if (pv) {
     var frame = pv.querySelector('iframe'), mode = 'tv';
+    // The real device's screen.width/height, recorded the last time it logged in through the
+    // device menu (see NexShow.php) — falls back to a generic 1920x1080 guess until that's known.
+    var deviceW = parseInt(pv.dataset.deviceW, 10) || 0;
+    var deviceH = parseInt(pv.dataset.deviceH, 10) || 0;
+    // Table Settings only: picking a frame from the dropdown swaps the preview's backdrop to that
+    // frame's own image/text, with the table forced on regardless of that frame's own toggle —
+    // just a visual backdrop, never touched by this page's own save.
+    var frameSelect = document.querySelector('[data-preview-frame-select]');
+    if (frameSelect) {
+      frameSelect.addEventListener('change', function () {
+        var base = frame.dataset.previewSrcBase;
+        var id = frameSelect.value;
+        frame.src = base + (id ? '&previewFrame=' + encodeURIComponent(id) : '') + '&t=' + Date.now();
+      });
+    }
     var points = pv.querySelectorAll('[data-table-point]');
     var offsetXInput = form.querySelector('[data-table-offset-x]');
     var offsetYInput = form.querySelector('[data-table-offset-y]');
+    var textOffsetXInput = form.querySelector('[data-text-offset-x]');
+    var textOffsetYInput = form.querySelector('[data-text-offset-y]');
     var curScale = 1, curLeft = 0;
+    // Dragging the title/description block itself nudges offsetX/offsetY — the same desktop-only
+    // nudge the Text card's own inputs write to. Bound fresh on every load since the iframe's
+    // document (and its elements) is recreated each time.
+    function bindTextMove(doc) {
+      var content = doc.querySelector('.slide__content');
+      if (!content || !textOffsetXInput || !textOffsetYInput) return;
+      content.style.cursor = 'grab';
+      content.addEventListener('pointerdown', function (e) {
+        e.preventDefault();
+        var startX = e.clientX, startY = e.clientY;
+        var startOffsetX = parseFloat(textOffsetXInput.value) || 0;
+        var startOffsetY = parseFloat(textOffsetYInput.value) || 0;
+        content.setPointerCapture(e.pointerId);
+        content.style.cursor = 'grabbing';
+        function onMove(ev) {
+          var nx = Math.round(startOffsetX + (ev.clientX - startX));
+          var ny = Math.round(startOffsetY + (ev.clientY - startY));
+          content.style.setProperty('--offset-x', nx + 'px');
+          content.style.setProperty('--offset-y', ny + 'px');
+          textOffsetXInput.value = nx + 'px';
+          textOffsetYInput.value = ny + 'px';
+        }
+        function onUp(ev) {
+          content.style.cursor = 'grab';
+          content.releasePointerCapture(ev.pointerId);
+          doc.removeEventListener('pointermove', onMove);
+          doc.removeEventListener('pointerup', onUp);
+          textOffsetXInput.dispatchEvent(new Event('input', { bubbles: true }));
+          textOffsetYInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        doc.addEventListener('pointermove', onMove);
+        doc.addEventListener('pointerup', onUp);
+      });
+    }
     // Dragging the table body itself nudges its position (like cropping an image), on top of
     // whatever the H/V alignment picks as the base position. Bound fresh on every load since the
     // iframe's document (and its elements) is recreated each time. Binds to .slide__table-pos (the
@@ -2366,27 +2665,23 @@ document.addEventListener('DOMContentLoaded', function () {
         doc.addEventListener('wheel', function (e) {
           window.scrollBy(0, e.deltaY);
         }, { passive: true });
-        // Touch devices have no wheel event — forward vertical drag the same way. Reads
-        // alongside the preview's own touch handling (slide swipe) rather than replacing it,
-        // since this only observes touches and never calls preventDefault.
-        var touchY = null;
-        doc.addEventListener('touchstart', function (e) {
-          touchY = e.touches.length === 1 ? e.touches[0].clientY : null;
-        }, { passive: true });
-        doc.addEventListener('touchmove', function (e) {
-          if (touchY === null || e.touches.length !== 1) return;
-          var y = e.touches[0].clientY;
-          window.scrollBy(0, touchY - y);
-          touchY = y;
-        }, { passive: true });
-        doc.addEventListener('touchend', function () { touchY = null; }, { passive: true });
+        // There used to be a touch equivalent here (forwarding a vertical finger-drag over the
+        // preview into a parent-page scroll, since the preview itself doesn't scroll). Removed:
+        // it listened across the whole preview, not just empty space, so it fired on every tiny
+        // touchmove — including the natural tremor of just holding a finger still, or the first
+        // few pixels of a real table/text drag before dragActive caught up — each one nudging the
+        // parent page's scroll position, which is what showed up as the whole UI "shaking" on
+        // touch. A touch user can still scroll this page normally from outside the preview box.
         bindTableMove(doc);
+        bindTextMove(doc);
       } catch (e) {}
       placePoints();
     });
     function fit() {
-      // TV: wide landscape, like a living-room screen. Phone: tall portrait.
-      var w = mode === 'phone' ? 390 : 1920, h = mode === 'phone' ? 844 : 1080;
+      // TV: the real device's own screen size when known, else a generic 1920x1080 guess.
+      // Phone: always the fixed 390x844 preset, a deliberate manual check, not a real device.
+      var w = mode === 'phone' ? 390 : (deviceW || 1920);
+      var h = mode === 'phone' ? 844 : (deviceH || 1080);
       var avail = pv.clientWidth;
       var s = Math.min(avail / w, mode === 'phone' ? 520 / h : 1);
       frame.style.width = w + 'px';
@@ -2457,6 +2752,17 @@ document.addEventListener('DOMContentLoaded', function () {
         if (!els) return;
         els.wrap.style.setProperty(prop, input.value || '0px');
         placePoints();
+      });
+    });
+    [[textOffsetXInput, '--offset-x'], [textOffsetYInput, '--offset-y']].forEach(function (pair) {
+      var input = pair[0], prop = pair[1];
+      if (!input) return;
+      // Typing a nudge value directly also live-updates the preview, the same as dragging does.
+      input.addEventListener('input', function () {
+        try {
+          var content = frame.contentDocument.querySelector('.slide__content');
+          if (content) content.style.setProperty(prop, input.value || '0px');
+        } catch (e) {}
       });
     });
     // A size slider's own typing/dragging also live-updates the preview, same as a point does

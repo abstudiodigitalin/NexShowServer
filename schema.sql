@@ -22,13 +22,20 @@ CREATE TABLE IF NOT EXISTS users (
   company_id    INT UNSIGNED NOT NULL,
   username      VARCHAR(80)  NOT NULL,
   email         VARCHAR(190) NULL, -- optional; used only to email "forgot password" reset links
-  password_hash VARCHAR(255) NOT NULL,
+  password_hash VARCHAR(255) NOT NULL, -- bcrypt; this is what login actually checks (password_verify())
+  password_aes  BLOB NULL, -- a second, reversible copy of the same password — MySQL AES_ENCRYPT(),
+    -- the server's default block_encryption_mode (aes-128-ecb unless changed), written alongside
+    -- password_hash whenever one is set (see xs_password_write_fragment() in db-config.php). Not
+    -- used for login; purely so the plaintext can be recovered later (e.g.
+    -- xs_db_decrypt_user_password()). NULL for any row whose password was never (re)set since this
+    -- column was added. ECB has no IV, so identical passwords produce identical password_aes bytes
+    -- — visible to anyone with database access without decrypting anything.
   role          ENUM('admin','user') NOT NULL DEFAULT 'user',
   status        ENUM('active','inactive') NOT NULL DEFAULT 'active',
   payment_status ENUM('none','pending','paid') NOT NULL DEFAULT 'none', -- 'none' = not subject to
     -- the per-user activation fee (the company's own founding admin, and anyone created before
     -- this existed). A user added via Settings > Add user starts 'pending' (and status
-    -- 'inactive') until Ab Studio Digital confirms payment and flips it to 'paid' directly in
+    -- 'inactive')j until Ab Studio Digital confirms payment and flips it to 'paid' directly in
     -- the database — a company's own admin can never do this themselves (see the 'toggle_user'
     -- guard in admin.php, which refuses to reactivate a still-pending user).
   expires_at    DATETIME NULL, -- 'user' role: 1 year from creation, checked at login and on every request after. 'admin' role: NULL, never expires.
@@ -60,6 +67,13 @@ CREATE TABLE IF NOT EXISTS site_settings (
   swipe_threshold       INT          NOT NULL DEFAULT 50,
   mobile_breakpoint     INT          NOT NULL DEFAULT 768,
   orientation           ENUM('landscape','portrait') NOT NULL DEFAULT 'landscape',
+  screen_width          INT UNSIGNED NULL, -- the device's screen.width/height, captured by the device-menu
+  screen_height         INT UNSIGNED NULL, -- login screen (see NexShow.php) so admin.php's frame preview can
+    -- size itself to match the real screen instead of a hardcoded 1920x1080 guess. NULL until that
+    -- device has logged in at least once since this column was added.
+  company_table         TEXT NULL, -- the one shared data table (rows, colors, position, sizing — same JSON
+    -- shape as a frame's old per-frame table) built in admin.php's Table Settings page; a frame just
+    -- opts in to showing it via its own table_data.enabled flag, NULL until built.
   updated_at            TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uniq_company (company_id),
   CONSTRAINT fk_settings_company FOREIGN KEY (company_id) REFERENCES companies(id)
