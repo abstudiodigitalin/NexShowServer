@@ -34,6 +34,15 @@ function xs_redirect($query = '', $msg = '', $type = 'ok')
     exit;
 }
 
+/** True only when this request is hitting the app via 127.0.0.1/localhost — i.e. a local dev
+ *  server, never a real deployment (Hostinger serves real hostnames). Used solely to allow the
+ *  registration OTP's fixed test code (see verify_registration) when there's no real mail server
+ *  around to actually deliver one locally. */
+function xs_is_localhost()
+{
+    return in_array($_SERVER['SERVER_NAME'] ?? '', ['localhost', '127.0.0.1', '::1'], true);
+}
+
 /** Sends a plain-text email via PHP's mail() (handed off to whatever MTA/SMTP relay is
  *  configured in php.ini — this is a thin wrapper, not a delivery guarantee). Used only for
  *  "forgot password" reset links. Never throws: a mail failure must not reveal whether an
@@ -229,13 +238,160 @@ function xs_table_from_post(array $p)
         'headerFontSize' => max(10, min(200, (int) ($p['tableHeaderFontSize'] ?? $p['tableFontSize'] ?? 16))),
         'textColor' => $hex($p['tableTextColor'] ?? '', '#ffffff'),
         'headerColor' => $hex($p['tableHeaderColor'] ?? '', '#ff2d8f'),
+        'headerBgOpacity' => round(max(0, min(1, (float) ($p['tableHeaderBgOpacity'] ?? 0))), 2),
         'borderColor' => $hex($p['tableBorderColor'] ?? '', '#ffffff'),
         'borderWidth' => max(0, min(8, (int) ($p['tableBorderWidth'] ?? 1))),
+        'bgColor' => $hex($p['tableBgColor'] ?? '', '#0a0908'),
         'bgOpacity' => round(max(0, min(1, (float) ($p['tableBgOpacity'] ?? 0.55))), 2),
         'rows' => $rows,
         'rowColors' => $hexList($grid['rowColors'] ?? [], count($rows)),
         'colColors' => $hexList($grid['colColors'] ?? [], $cols),
+        'title' => xs_text($p['tableTitle'] ?? '', 60),
+        'footer' => xs_text($p['tableFooter'] ?? '', 80),
+        'bannerColor' => $hex($p['tableBannerColor'] ?? '', '#4a0f12'),
+        'bannerTextColor' => $hex($p['tableBannerTextColor'] ?? '', '#c9a04e'),
+        'footerColor' => $hex($p['tableFooterColor'] ?? '', '#c9a04e'),
+        // Free-floating text labels — independent of the table itself (can be on even if the table
+        // is off), each draggable anywhere on the slide on its own, and each one's text runs
+        // through the same {{tag}} substitution as table cells — e.g. "Updated {{RATEDATE}}
+        // {{RATETIME}}" placed as a badge. Up to 8 per frame.
+        'labels' => xs_labels_from_post($p['tableLabelsJson'] ?? ''),
     ]);
+}
+
+function xs_labels_from_post($raw)
+{
+    $hex = function ($v, $fallback) {
+        $v = (string) $v;
+        return preg_match('/^#[0-9a-f]{6}$/i', $v) ? $v : $fallback;
+    };
+    $in = $raw !== '' ? json_decode((string) $raw, true) : null;
+    if (!is_array($in)) return [];
+    $out = [];
+    foreach (array_slice($in, 0, 8) as $lbl) { // cap 8 labels
+        if (!is_array($lbl)) continue;
+        $text = xs_text((string) ($lbl['text'] ?? ''), 200);
+        if ($text === '') continue; // an emptied-out label just drops from the list
+        $out[] = [
+            'text' => $text,
+            'hAlign' => xs_enum($lbl['hAlign'] ?? '', ['left', 'center', 'right'], 'center'),
+            'vAlign' => xs_enum($lbl['vAlign'] ?? '', ['top', 'center', 'bottom'], 'center'),
+            'offsetX' => xs_css($lbl['offsetX'] ?? '') ?: '0px',
+            'offsetY' => xs_css($lbl['offsetY'] ?? '') ?: '0px',
+            'fontSize' => max(10, min(200, (int) ($lbl['fontSize'] ?? 20))),
+            'color' => $hex($lbl['color'] ?? '', '#ffffff'),
+        ];
+    }
+    return $out;
+}
+
+// Gold gets 6 karat levels, silver 4 purity levels, platinum just the one — each metal only ever
+// needs as many as it actually trades at.
+const XS_RATE_GOLD_LEVELS = 6;
+const XS_RATE_SILVER_LEVELS = 4;
+const XS_RATE_PLATINUM_LEVELS = 1;
+
+/** Builds one metal's set of levels (up to $count, each a label + 3 independent percentages, plus
+ *  a ₹ amount and an on/off switch for each one) from the edit form, using $prefix to read the
+ *  right fields (e.g. "rateLabel" for gold, "silverRateLabel" for silver). */
+function xs_rate_levels_from_post(array $p, $prefix, $count)
+{
+    $pct = function ($v) {
+        return round(max(0, min(1000, (float) $v)), 3);
+    };
+    $amt = function ($v) {
+        return round(max(0, min(10000000, (float) $v)), 2);
+    };
+    $levels = [];
+    for ($i = 1; $i <= $count; $i++) {
+        $levels[] = [
+            'label' => xs_text($p[$prefix . 'Label' . $i] ?? '', 40),
+            'salePct' => $pct($p[$prefix . 'SalePct' . $i] ?? 0),
+            'saleAmt' => $amt($p[$prefix . 'SaleAmt' . $i] ?? 0),
+            'saleUseAmt' => !empty($p[$prefix . 'SaleUseAmt' . $i]),
+            'urPct' => $pct($p[$prefix . 'UrPct' . $i] ?? 0),
+            'urAmt' => $amt($p[$prefix . 'UrAmt' . $i] ?? 0),
+            'urUseAmt' => !empty($p[$prefix . 'UrUseAmt' . $i]),
+            'exchangePct' => $pct($p[$prefix . 'ExchangePct' . $i] ?? 0),
+            'exchangeAmt' => $amt($p[$prefix . 'ExchangeAmt' . $i] ?? 0),
+            'exchangeUseAmt' => !empty($p[$prefix . 'ExchangeUseAmt' . $i]),
+        ];
+    }
+    return $levels;
+}
+
+/** Builds the Rate page's config from the edit form: one standard rate for gold plus its karat
+ *  levels, a second, independent standard rate for silver plus its own (shorter) set of levels,
+ *  and a third for platinum with just its one level — each metal trades at a very different
+ *  ₹/unit scale, so none of them ever share a standard rate. */
+function xs_rate_config_from_post(array $p)
+{
+    return [
+        'standardRate' => round(max(0, (float) ($p['rateStandard'] ?? 0)), 2),
+        'levels' => xs_rate_levels_from_post($p, 'rate', XS_RATE_GOLD_LEVELS),
+        'silverStandardRate' => round(max(0, (float) ($p['silverRateStandard'] ?? 0)), 2),
+        'silverLevels' => xs_rate_levels_from_post($p, 'silverRate', XS_RATE_SILVER_LEVELS),
+        'platinumStandardRate' => round(max(0, (float) ($p['platinumRateStandard'] ?? 0)), 2),
+        'platinumLevels' => xs_rate_levels_from_post($p, 'platinumRate', XS_RATE_PLATINUM_LEVELS),
+    ];
+}
+
+/** Computes the gold PURITY/SALERATE/URRATE/EXCHANGERATE 1-6 tag values, their silver
+ *  SILVERPURITY/SILVERSALERATE/SILVERURRATE/SILVEREXCHANGERATE 1-4 counterparts, and platinum's
+ *  single PLATINUMPURITY1/PLATINUMSALERATE1/PLATINUMURRATE1/PLATINUMEXCHANGERATE1 from a rate
+ *  config. PURITYn is that level's own Label text (e.g. "24K") — not an amount. SALERATE/URRATE/
+ *  EXCHANGERATE are ₹ amounts, each either a straight percentage of the standard rate (the
+ *  default) or, when that level's "₹ instead of %" switch is on, the standard rate minus a flat
+ *  ₹ amount instead — clamped to 0 so a deduction larger than the rate never goes negative.
+ *  Returns every name for every level actually in $cfg, even ones computing to 0 or empty (a
+ *  cleared label/percentage/amount should visibly clear that tag rather than leave a stale value
+ *  behind). */
+function xs_rate_compute_tags(array $cfg)
+{
+    $out = [];
+    $metals = [
+        '' => [(float) ($cfg['standardRate'] ?? 0), (array) ($cfg['levels'] ?? [])],
+        'SILVER' => [(float) ($cfg['silverStandardRate'] ?? 0), (array) ($cfg['silverLevels'] ?? [])],
+        'PLATINUM' => [(float) ($cfg['platinumStandardRate'] ?? 0), (array) ($cfg['platinumLevels'] ?? [])],
+    ];
+    $apply = function ($standard, $pct, $amt, $useAmt) {
+        return $useAmt ? ($standard - $amt) : ($standard * $pct / 100);
+    };
+    foreach ($metals as $tagPrefix => [$standard, $levels]) {
+        foreach ($levels as $i => $lvl) {
+            $n = $i + 1;
+            $out[$tagPrefix . 'PURITY' . $n] = (string) ($lvl['label'] ?? '');
+            $sale = $apply($standard, (float) ($lvl['salePct'] ?? 0), (float) ($lvl['saleAmt'] ?? 0), !empty($lvl['saleUseAmt']));
+            $ur = $apply($standard, (float) ($lvl['urPct'] ?? 0), (float) ($lvl['urAmt'] ?? 0), !empty($lvl['urUseAmt']));
+            $exchange = $apply($standard, (float) ($lvl['exchangePct'] ?? 0), (float) ($lvl['exchangeAmt'] ?? 0), !empty($lvl['exchangeUseAmt']));
+            $out[$tagPrefix . 'SALERATE' . $n] = (string) round(max(0, $sale));
+            $out[$tagPrefix . 'URRATE' . $n] = (string) round(max(0, $ur));
+            $out[$tagPrefix . 'EXCHANGERATE' . $n] = (string) round(max(0, $exchange));
+        }
+    }
+    return $out;
+}
+
+/** A starting rate config for a company that's never set one up: standard karat percentages for
+ *  gold, standard purity percentages for silver, and platinum's one level, with sale/UR/exchange
+ *  left at 100% (no markup/markdown) until set otherwise. Used both for the Rate page's first
+ *  visit and for the Frames page's quick "SET RATE" popup, so either entry point works even
+ *  before a full visit to Rate. */
+function xs_rate_config_default()
+{
+    $makeLevels = function (array $labels) {
+        return array_map(function ($label) {
+            return ['label' => $label, 'salePct' => '100', 'saleAmt' => '0', 'saleUseAmt' => false, 'urPct' => '100', 'urAmt' => '0', 'urUseAmt' => false, 'exchangePct' => '100', 'exchangeAmt' => '0', 'exchangeUseAmt' => false];
+        }, $labels);
+    };
+    return [
+        'standardRate' => 0,
+        'levels' => $makeLevels(['24K', '22K', '20K', '18K', '14K', '10K']),
+        'silverStandardRate' => 0,
+        'silverLevels' => $makeLevels(['999', '925', '900', '835']),
+        'platinumStandardRate' => 0,
+        'platinumLevels' => $makeLevels(['Platinum']),
+    ];
 }
 
 function xs_frame_from_post(array $p, $id)
@@ -266,6 +422,7 @@ function xs_frame_from_post(array $p, $id)
     $mf = xs_css($p['mobileFocalPoint'] ?? '');
     if ($mf !== '') $f['mobileFocalPoint'] = $mf;
     $f['kenBurns'] = !empty($p['kenBurns']);
+    $f['muteVideo'] = !empty($p['muteVideo']);
 
     $color = (string) ($p['textColor'] ?? '');
     $f['textColor'] = preg_match('/^#[0-9a-f]{6}$/i', $color) ? $color : '#ffffff';
@@ -283,9 +440,9 @@ function xs_frame_from_post(array $p, $id)
     $d = trim((string) ($p['duration'] ?? ''));
     if ($d !== '' && is_numeric($d)) $f['duration'] = (int) round(max(1, min(60, (float) $d)) * 1000);
 
-    // The table itself (rows, colors, position, sizing) is built once for the whole company in
-    // Table Settings — a frame only ever stores whether it opts in to showing that shared table.
-    $f['tableData'] = json_encode(['enabled' => !empty($p['tableEnabled'])]);
+    // Table content/colors/position are edited on Table Settings' own per-frame editor now, not
+    // this form — tableData is deliberately left unset here; the save_frame handler carries over
+    // whatever this frame already has instead.
 
     return $f;
 }
@@ -312,6 +469,22 @@ if ($authed && !empty($_SESSION['xs_expires_at']) && strtotime($_SESSION['xs_exp
     $_SESSION['flash'] = ['error', 'Your account has expired. Contact your admin.'];
     session_regenerate_id(true);
     $authed = false;
+}
+
+// One admin session per account — a fresh login (or a just-completed registration, see
+// verify_registration) overwrites device_session_token, which is how the previous device gets
+// signed out: the very next request it makes finds its own xs_admin_token no longer matches the
+// row and drops it. Shared with NexShow.php's single-device enforcement for 'user' role logins —
+// an admin row never goes through that screen (and a device row never through this one), so the
+// same column never collides between the two.
+if ($authed) {
+    $currentUser = xs_db_find_user_by_id((int) $_SESSION['xs_user_id']);
+    if ($currentUser !== null && (string) $currentUser['device_session_token'] !== (string) ($_SESSION['xs_admin_token'] ?? '')) {
+        $_SESSION = [];
+        $_SESSION['flash'] = ['error', 'Signed out — this account signed in on another device.'];
+        session_regenerate_id(true);
+        $authed = false;
+    }
 }
 
 $companyId = $authed ? (int) $_SESSION['xs_company_id'] : null;
@@ -352,21 +525,103 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $username = xs_text($_POST['username'] ?? '', 80);
                 $email = xs_text($_POST['email'] ?? '', 190);
                 $pw = (string) ($_POST['password'] ?? '');
-                if ($companyName === '') xs_redirect('', 'Enter your company name.', 'error');
-                if ($username === '') xs_redirect('', 'Choose a username.', 'error');
-                if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) xs_redirect('', 'Enter a valid email address.', 'error');
-                if (strlen($pw) < 8) xs_redirect('', 'Use at least 8 characters.', 'error');
-                if ($pw !== (string) ($_POST['confirm'] ?? '')) xs_redirect('', 'The two passwords do not match.', 'error');
-                if (!$dbOk) xs_redirect('', 'Could not reach the database.', 'error');
-                $reg = xs_db_register_company($companyName, $username, password_hash($pw, PASSWORD_DEFAULT), $pw, $email !== '' ? $email : null);
+                $referralCode = trim(xs_text($_POST['referralCode'] ?? '', 32));
+                if ($companyName === '') xs_redirect('view=register', 'Enter your company name.', 'error');
+                if ($username === '') xs_redirect('view=register', 'Choose a username.', 'error');
+                if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) xs_redirect('view=register', 'Enter a valid email address — we send a code there to verify it.', 'error');
+                if (strlen($pw) < 8) xs_redirect('view=register', 'Use at least 8 characters.', 'error');
+                if ($pw !== (string) ($_POST['confirm'] ?? '')) xs_redirect('view=register', 'The two passwords do not match.', 'error');
+                if (!$dbOk) xs_redirect('view=register', 'Could not reach the database.', 'error');
+                // Checked now (not just left to the DB's unique constraint at final creation) so a
+                // doomed registration never wastes a verification email the user has to look for.
+                if (xs_db_find_user_by_username($username)) xs_redirect('view=register', 'That username is already taken.', 'error');
+                $referralCodeId = null;
+                if ($referralCode !== '') {
+                    $referralRow = xs_db_find_referral_code_by_code($referralCode);
+                    if (!$referralRow) xs_redirect('view=register', 'That referral code was not recognised.', 'error');
+                    $referralCodeId = (int) $referralRow['id'];
+                }
+                $otp = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+                // Nothing is written to the database until the code is verified — a company/user
+                // row for an email nobody confirmed ownership of would just be dead weight (and a
+                // username someone else might actually want). The plaintext password only ever
+                // sits in server-side session storage for the few minutes until that happens, same
+                // trust boundary as the reversible password_aes copy this app already keeps in the
+                // database for every account.
+                $_SESSION['xs_pending_reg'] = [
+                    'companyName' => $companyName,
+                    'username' => $username,
+                    'email' => $email,
+                    'passwordHash' => password_hash($pw, PASSWORD_DEFAULT),
+                    'passwordPlain' => $pw,
+                    'otpHash' => hash('sha256', $otp),
+                    'otpExpires' => time() + 600,
+                    'attempts' => 0,
+                    'resendAt' => time() + 45,
+                    'referralCodeId' => $referralCodeId,
+                ];
+                xs_send_mail(
+                    $email,
+                    'Verify your NexShoW account',
+                    "Your verification code is: $otp\n\n"
+                        . "Enter this on the registration screen to finish setting up \"$companyName\"'s account. "
+                        . "This code expires in 10 minutes.\n\n"
+                        . "If you didn't request this, you can safely ignore this email."
+                );
+                xs_redirect('view=verify_email', 'We sent a 6-digit code to ' . $email . '.');
+            }
+            if ($action === 'verify_registration') {
+                $pending = $_SESSION['xs_pending_reg'] ?? null;
+                if (!is_array($pending)) xs_redirect('view=register', 'Start a new registration.', 'error');
+                if (time() > $pending['otpExpires']) {
+                    unset($_SESSION['xs_pending_reg']);
+                    xs_redirect('view=register', 'That code expired. Please register again.', 'error');
+                }
+                $code = preg_replace('/\D/', '', (string) ($_POST['otp'] ?? ''));
+                // Local dev only (never a real deployment, see xs_is_localhost): 226699 always
+                // works, so the flow can be tested end to end without a working local mail server.
+                $isValidCode = hash_equals($pending['otpHash'], hash('sha256', $code)) || (xs_is_localhost() && $code === '226699');
+                if (!$isValidCode) {
+                    $_SESSION['xs_pending_reg']['attempts']++;
+                    if ($_SESSION['xs_pending_reg']['attempts'] >= 6) {
+                        unset($_SESSION['xs_pending_reg']);
+                        xs_redirect('view=register', 'Too many incorrect attempts. Please register again.', 'error');
+                    }
+                    xs_redirect('view=verify_email', 'Incorrect code. Please try again.', 'error');
+                }
+                if (!$dbOk) xs_redirect('view=verify_email', 'Could not reach the database.', 'error');
+                $reg = xs_db_register_company($pending['companyName'], $pending['username'], $pending['passwordHash'], $pending['passwordPlain'], $pending['email'], $pending['referralCodeId'] ?? null);
+                unset($_SESSION['xs_pending_reg']);
                 $newUser = xs_db_find_user_by_id($reg['userId']);
+                $adminToken = bin2hex(random_bytes(20));
+                xs_db_set_device_session_token($reg['userId'], $adminToken);
                 session_regenerate_id(true);
                 $_SESSION['xs_auth'] = true;
                 $_SESSION['xs_user_id'] = $reg['userId'];
                 $_SESSION['xs_company_id'] = $reg['companyId'];
                 $_SESSION['xs_role'] = 'admin';
                 $_SESSION['xs_expires_at'] = $newUser['expires_at'];
+                $_SESSION['xs_admin_token'] = $adminToken;
                 xs_redirect('', 'Company registered. Welcome to your slider admin.');
+            }
+            if ($action === 'resend_registration_otp') {
+                $pending = $_SESSION['xs_pending_reg'] ?? null;
+                if (!is_array($pending)) xs_redirect('view=register', 'Start a new registration.', 'error');
+                if (time() < $pending['resendAt']) xs_redirect('view=verify_email', 'Please wait a moment before requesting another code.', 'error');
+                $otp = str_pad((string) random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+                $_SESSION['xs_pending_reg']['otpHash'] = hash('sha256', $otp);
+                $_SESSION['xs_pending_reg']['otpExpires'] = time() + 600;
+                $_SESSION['xs_pending_reg']['attempts'] = 0;
+                $_SESSION['xs_pending_reg']['resendAt'] = time() + 45;
+                xs_send_mail(
+                    $pending['email'],
+                    'Verify your NexShoW account',
+                    "Your verification code is: $otp\n\n"
+                        . "Enter this on the registration screen to finish setting up \"{$pending['companyName']}\"'s account. "
+                        . "This code expires in 10 minutes.\n\n"
+                        . "If you didn't request this, you can safely ignore this email."
+                );
+                xs_redirect('view=verify_email', 'A new code is on its way.');
             }
             if ($action === 'login') {
                 $username = xs_text($_POST['username'] ?? '', 80);
@@ -382,12 +637,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         xs_db_expire_user((int) $user['id']);
                         xs_redirect('', 'That account has expired. Contact your admin.', 'error');
                     }
+                    // A fresh token here, saved to this user's row, is what signs out whichever
+                    // other device was already logged in as this same admin (see the per-request
+                    // check up in State, above).
+                    $adminToken = bin2hex(random_bytes(20));
+                    xs_db_set_device_session_token((int) $user['id'], $adminToken);
                     session_regenerate_id(true);
                     $_SESSION['xs_auth'] = true;
                     $_SESSION['xs_user_id'] = (int) $user['id'];
                     $_SESSION['xs_company_id'] = (int) $user['company_id'];
                     $_SESSION['xs_role'] = $user['role'];
                     $_SESSION['xs_expires_at'] = $user['expires_at'];
+                    $_SESSION['xs_admin_token'] = $adminToken;
                     xs_redirect();
                 }
                 sleep(1);
@@ -442,6 +703,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if (!$dbOk) xs_redirect($back, 'Could not reach the database. The frame was not saved.', 'error');
                 if ($id !== '' && $idx < 0) xs_redirect('', 'That frame no longer exists.', 'error');
                 $frame = xs_frame_from_post($_POST, $id !== '' ? $id : xs_new_id($_POST['title'] ?? '', $frames));
+                // This form never touches the table (that's Table Settings' per-frame editor now)
+                // — carry the existing one over so a plain detail save doesn't blank it out.
+                $frame['tableData'] = $idx >= 0 ? ($frames[$idx]['tableData'] ?? null) : null;
                 foreach (['image' => true, 'mobileImage' => false] as $k => $allowVideo) {
                     $path = xs_upload($companyId, $k . '_file', $allowVideo);
                     if ($path !== null) $frame[$k] = $path;
@@ -569,10 +833,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $target['payment_status'] = 'none';
                 }
                 // Only a user whose fee is actually marked 'paid' can be switched back on from
-                // here — 'pending' (awaiting confirmation) or 'none' (never paid, or expired and
-                // reset back to needing a fresh payment) both require going through the payment
-                // flow again instead; only Ab Studio Digital can mark that 'paid' directly in
-                // the database.
+                // here — 'pending' or 'none' (never paid, or expired and reset back to needing a
+                // fresh payment) both require going through the Razorpay payment flow again
+                // instead (razorpay_verify_payment, below, is what actually flips this to 'paid').
                 if ($status === 'active' && $target && $target['payment_status'] !== 'paid') {
                     xs_redirect('view=settings', 'This user needs a payment before it can be activated.', 'error');
                 }
@@ -583,6 +846,88 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
                 xs_db_set_user_status($companyId, $targetId, $status);
                 xs_redirect('view=settings', $status === 'active' ? 'User reactivated.' : 'User deactivated.');
+                break;
+
+            // Step 1 of the Razorpay flow: create an order server-side (Key Secret never leaves
+            // the server) and hand the browser back just enough to open Razorpay's own Checkout
+            // widget — an order id, the amount, and the public Key ID. Returns JSON, not a
+            // redirect: this is called from JS right before opening that widget, not a page nav.
+            case 'razorpay_create_order':
+                header('Content-Type: application/json');
+                if (!$canManageUsers) { http_response_code(403); echo json_encode(['error' => 'Only an admin can manage users.']); exit; }
+                if (!$dbOk) { http_response_code(503); echo json_encode(['error' => 'Could not reach the database.']); exit; }
+                $targetId = (int) ($_POST['userId'] ?? 0);
+                $target = xs_db_find_company_user($companyId, $targetId);
+                if (!$target) { http_response_code(404); echo json_encode(['error' => 'User not found.']); exit; }
+                if ($target['status'] === 'active' && $target['payment_status'] === 'paid') {
+                    http_response_code(400);
+                    echo json_encode(['error' => 'This user is already active.']);
+                    exit;
+                }
+                $companyRow = xs_db_get_company($companyId);
+                // Referral code typed into the pay window on this particular payment wins; if left
+                // blank, fall back to the code (if any) the company itself registered with — see
+                // xs_db_find_referral_code_by_code() / the `referral_code_id` column on `companies`.
+                $referralCode = trim(xs_text($_POST['referralCode'] ?? '', 32));
+                if ($referralCode !== '') {
+                    $referralRow = xs_db_find_referral_code_by_code($referralCode);
+                    if (!$referralRow) {
+                        http_response_code(400);
+                        echo json_encode(['error' => 'That referral code was not recognised.', 'invalidReferral' => true]);
+                        exit;
+                    }
+                    $referralCodeId = (int) $referralRow['id'];
+                } else {
+                    $referralCodeId = $companyRow['referral_code_id'] ?? null;
+                }
+                $amountPaise = 399900; // ₹2,999 activation fee
+                try {
+                    $orderId = xs_razorpay_create_order($amountPaise, 'user' . $targetId . '-' . time());
+                    xs_db_create_payment($companyId, $targetId, $orderId, $amountPaise, 'INR', $referralCodeId);
+                } catch (RuntimeException $ex) {
+                    http_response_code(502);
+                    echo json_encode(['error' => $ex->getMessage()]);
+                    exit;
+                }
+                echo json_encode([
+                    'orderId' => $orderId,
+                    'amount' => $amountPaise,
+                    'keyId' => XS_RAZORPAY_KEY_ID,
+                    'username' => $target['username'],
+                    'companyName' => $companyRow['name'] ?? '',
+                ]);
+                exit;
+
+            // Step 2: the browser hands back what Razorpay's Checkout widget returned on success
+            // (order id, payment id, signature). The signature is what's actually trusted here —
+            // see xs_razorpay_verify_signature() — never the mere fact that the widget called its
+            // success handler, which proves nothing about whether money actually moved.
+            case 'razorpay_verify_payment':
+                if (!$canManageUsers) xs_redirect('view=settings', 'Only an admin can manage users.', 'error');
+                if (!$dbOk) xs_redirect('view=settings', 'Could not reach the database.', 'error');
+                $targetId = (int) ($_POST['userId'] ?? 0);
+                $rpOrderId = xs_text($_POST['razorpayOrderId'] ?? '', 64);
+                $rpPaymentId = xs_text($_POST['razorpayPaymentId'] ?? '', 64);
+                $rpSignature = xs_text($_POST['razorpaySignature'] ?? '', 128);
+                $target = xs_db_find_company_user($companyId, $targetId);
+                if (!$target) xs_redirect('view=settings', 'User not found.', 'error');
+                $payment = xs_db_find_payment_by_order($companyId, $rpOrderId);
+                if (!$payment || (int) $payment['user_id'] !== $targetId) {
+                    xs_redirect('view=settings', 'Payment record not found.', 'error');
+                }
+                if ($payment['status'] === 'paid') {
+                    xs_redirect('view=settings', 'That payment was already confirmed.');
+                }
+                if (!xs_razorpay_verify_signature($rpOrderId, $rpPaymentId, $rpSignature)) {
+                    xs_db_mark_payment_failed((int) $payment['id']);
+                    xs_redirect('view=settings', "Payment verification failed — if you were charged, use WhatsApp Support and we'll sort it out.", 'error');
+                }
+                xs_db_mark_payment_paid((int) $payment['id'], $rpPaymentId, $rpSignature);
+                xs_db_activate_paid_user($companyId, $targetId, $rpPaymentId);
+                if (!empty($payment['referral_code_id'])) {
+                    xs_db_create_referral_credit((int) $payment['referral_code_id'], $companyId, (int) $payment['id']);
+                }
+                xs_redirect('view=settings', $target['username'] . ' is now active for one year.');
                 break;
 
             case 'reset_user_password':
@@ -618,13 +963,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 xs_redirect('view=settings', $n ? "Deleted $n unused file" . ($n === 1 ? '' : 's') . '.' : 'There were no unused files.');
                 break;
 
-            case 'save_company_table':
-                if (!$dbOk) xs_redirect('view=table', 'Could not reach the database. The table was not saved.', 'error');
-                $p = $_POST;
-                $p['tableEnabled'] = '1'; // the shared table has no on/off of its own — each frame opts in separately
-                $tableJson = xs_table_from_post($p);
-                xs_db_save_settings($companyId, ['companyTable' => $tableJson]);
-                xs_redirect('view=table', 'Table saved.');
+            case 'save_frame_table':
+                $frameId = (string) ($_POST['frameId'] ?? '');
+                $frameIdx = $frameId === '' ? -1 : xs_find($frames, $frameId);
+                if (!$dbOk) xs_redirect('view=table&frame=' . rawurlencode($frameId), 'Could not reach the database. The table was not saved.', 'error');
+                if ($frameIdx < 0) xs_redirect('view=table', 'That frame no longer exists.', 'error');
+                $updatedFrame = $frames[$frameIdx];
+                $updatedFrame['tableData'] = xs_table_from_post($_POST);
+                xs_db_update_frame($companyId, $frameId, $updatedFrame);
+                xs_redirect('view=table&frame=' . rawurlencode($frameId), 'Table saved for that frame.');
+                break;
+
+            case 'save_rate_config':
+                if (!$dbOk) xs_redirect('view=rate', 'Could not reach the database. Rates were not saved.', 'error');
+                $rateConfig = xs_rate_config_from_post($_POST);
+                xs_db_save_settings($companyId, ['rateConfig' => json_encode($rateConfig)]);
+                // Writes straight into the same `tags` table the Tags section manages — every
+                // computed rate becomes an ordinary {{name}} tag, usable anywhere a tag already is.
+                foreach (xs_rate_compute_tags($rateConfig) as $tagName => $tagValue) {
+                    xs_db_save_tag($companyId, $tagName, $tagValue);
+                }
+                // {{RATEDATE}}/{{RATETIME}} — when this save happened, so a table can show shoppers
+                // how fresh the rate on display is, same as the computed rate tags above.
+                xs_db_save_tag($companyId, 'RATEDATE', date('d M Y'));
+                xs_db_save_tag($companyId, 'RATETIME', date('h:i A'));
+                xs_redirect('view=rate', 'Rates saved — PURITY, SALERATE, URRATE and EXCHANGERATE tags are updated.');
+                break;
+
+            case 'save_standard_rate':
+                if (!$dbOk) xs_redirect($back, 'Could not reach the database. Rate was not saved.', 'error');
+                // The quick "SET RATE" popup on Frames only ever touches the three standard rates
+                // (one per metal) — every level's own percentages (set on the Rate page) carry over
+                // untouched, same as a first-time save would start from the same sensible defaults
+                // that page does.
+                $quickRateConfig = !empty($settings['rateConfig']) ? json_decode($settings['rateConfig'], true) : null;
+                if (!is_array($quickRateConfig) || empty($quickRateConfig['levels'])) $quickRateConfig = xs_rate_config_default();
+                $quickRateConfig['standardRate'] = round(max(0, (float) ($_POST['rateStandard'] ?? 0)), 2);
+                $quickRateConfig['silverStandardRate'] = round(max(0, (float) ($_POST['silverRateStandard'] ?? 0)), 2);
+                $quickRateConfig['platinumStandardRate'] = round(max(0, (float) ($_POST['platinumRateStandard'] ?? 0)), 2);
+                xs_db_save_settings($companyId, ['rateConfig' => json_encode($quickRateConfig)]);
+                foreach (xs_rate_compute_tags($quickRateConfig) as $tagName => $tagValue) {
+                    xs_db_save_tag($companyId, $tagName, $tagValue);
+                }
+                xs_db_save_tag($companyId, 'RATEDATE', date('d M Y'));
+                xs_db_save_tag($companyId, 'RATETIME', date('h:i A'));
+                xs_redirect($back, 'Standard rates updated — all rate tags refreshed.');
                 break;
 
             case 'save_tag':
@@ -667,7 +1050,7 @@ unset($_SESSION['flash']);
 // a new company to sign up.
 if (!$authed) {
     $view = (string) ($_GET['view'] ?? '');
-    if (!in_array($view, ['register', 'login', 'forgot', 'reset'], true)) $view = 'login';
+    if (!in_array($view, ['register', 'login', 'forgot', 'reset', 'verify_email'], true)) $view = 'login';
     // A reset link is only shown to type a new password into once we know its token is
     // still valid — otherwise send them back to ask for a fresh one.
     if ($view === 'reset') {
@@ -676,9 +1059,15 @@ if (!$authed) {
             xs_redirect('view=forgot', 'That reset link is invalid or has expired.', 'error');
         }
     }
+    // The code-entry screen only makes sense while a registration is actually pending — reached
+    // directly (a stale bookmark, a reload after it already completed or expired) sends them back
+    // to start a fresh one instead of showing a form with nothing to submit against.
+    if ($view === 'verify_email' && !is_array($_SESSION['xs_pending_reg'] ?? null)) {
+        xs_redirect('view=register', 'Start a new registration.', 'error');
+    }
 } else {
     $view = (string) ($_GET['view'] ?? 'frames');
-    if (!in_array($view, ['frames', 'edit', 'table', 'settings'], true)) $view = 'frames';
+    if (!in_array($view, ['frames', 'edit', 'table', 'rate', 'settings'], true)) $view = 'frames';
 }
 
 $defaultSeconds = $settings['duration'] / 1000;
@@ -692,18 +1081,51 @@ if ($view === 'edit') {
     $table = !empty($raw['tableData']) ? json_decode($raw['tableData'], true) : null;
     if (!is_array($table)) $table = [];
     $titleSizePx = xs_title_size_px($raw['titleSize'] ?? '');
-    $companyTableDecoded = !empty($settings['companyTable']) ? json_decode($settings['companyTable'], true) : null;
-    $companyTableBuilt = is_array($companyTableDecoded) && !empty($companyTableDecoded['rows']);
 }
 
 if ($view === 'table') {
-    $companyTable = !empty($settings['companyTable']) ? json_decode($settings['companyTable'], true) : null;
-    if (!is_array($companyTable)) $companyTable = [];
-    $companyTableGrid = [
-        'rows' => !empty($companyTable['rows']) && is_array($companyTable['rows']) ? $companyTable['rows'] : [['', ''], ['', '']],
-        'rowColors' => is_array($companyTable['rowColors'] ?? null) ? $companyTable['rowColors'] : [],
-        'colColors' => is_array($companyTable['colColors'] ?? null) ? $companyTable['colColors'] : [],
-    ];
+    // Picking a frame from the dropdown navigates here with ?frame=<id> — each frame's table
+    // (content, colors, position — all of it) is fully its own, edited right here. No selection
+    // (or an id that no longer exists) just leaves the editor panel hidden.
+    $tableFrameId = (string) ($_GET['frame'] ?? '');
+    $tableFrameIdx = $tableFrameId === '' ? -1 : xs_find($frames, $tableFrameId);
+    if ($tableFrameIdx >= 0) {
+        $table = !empty($frames[$tableFrameIdx]['tableData']) ? json_decode($frames[$tableFrameIdx]['tableData'], true) : null;
+        if (!is_array($table)) $table = [];
+        $tableGrid = [
+            'rows' => !empty($table['rows']) && is_array($table['rows']) ? $table['rows'] : [['', ''], ['', '']],
+            'rowColors' => is_array($table['rowColors'] ?? null) ? $table['rowColors'] : [],
+            'colColors' => is_array($table['colColors'] ?? null) ? $table['colColors'] : [],
+        ];
+    }
+}
+
+if ($view === 'rate') {
+    $rateConfig = !empty($settings['rateConfig']) ? json_decode($settings['rateConfig'], true) : null;
+    if (!is_array($rateConfig) || empty($rateConfig['levels'])) $rateConfig = xs_rate_config_default();
+    // A config saved before silver/platinum rates existed has gold's levels but not the newer
+    // metals' yet — fill those in from the default rather than treating the whole config as unset.
+    $rateDefaults = xs_rate_config_default();
+    foreach (['silverLevels' => 'silverStandardRate', 'platinumLevels' => 'platinumStandardRate'] as $levelsKey => $rateKey) {
+        if (empty($rateConfig[$levelsKey])) {
+            $rateConfig[$rateKey] = $rateConfig[$rateKey] ?? 0;
+            $rateConfig[$levelsKey] = $rateDefaults[$levelsKey];
+        }
+    }
+    // A config saved under an older level count (gold used to go up to 10) is padded/truncated to
+    // today's count so the form always shows exactly XS_RATE_GOLD_LEVELS/XS_RATE_SILVER_LEVELS/
+    // XS_RATE_PLATINUM_LEVELS rows — extra trailing levels are dropped (the first ones are the
+    // ones in use), a short list is padded with blank rows.
+    $xs_rate_pad = function (array $levels, $count) {
+        $blank = ['label' => '', 'salePct' => '0', 'saleAmt' => '0', 'saleUseAmt' => false, 'urPct' => '0', 'urAmt' => '0', 'urUseAmt' => false, 'exchangePct' => '0', 'exchangeAmt' => '0', 'exchangeUseAmt' => false];
+        // array_merge fills in saleAmt/urAmt/exchangeAmt/*UseAmt for a level saved before this
+        // feature existed, so old data doesn't trip an undefined-key warning or fall back to blank.
+        $levels = array_map(function ($lvl) use ($blank) { return array_merge($blank, (array) $lvl); }, $levels);
+        return array_pad(array_slice($levels, 0, $count), $count, $blank);
+    };
+    $rateConfig['levels'] = $xs_rate_pad($rateConfig['levels'], XS_RATE_GOLD_LEVELS);
+    $rateConfig['silverLevels'] = $xs_rate_pad($rateConfig['silverLevels'], XS_RATE_SILVER_LEVELS);
+    $rateConfig['platinumLevels'] = $xs_rate_pad($rateConfig['platinumLevels'], XS_RATE_PLATINUM_LEVELS);
 }
 
 // Image library: photos uploaded to images/Frame.
@@ -776,7 +1198,7 @@ function xs_image_field($name, $label, $hint, $value, $focalName, $focalValue, $
     </div>
 <?php }
 
-$titles =['register' => 'Register', 'login' => 'Log in', 'forgot' => 'Forgot password', 'reset' => 'Reset password', 'frames' => 'Frames', 'edit' => 'Edit frame', 'table' => 'Table Settings', 'settings' => 'Settings'];
+$titles =['register' => 'Register', 'login' => 'Log in', 'forgot' => 'Forgot password', 'reset' => 'Reset password', 'frames' => 'Frames', 'edit' => 'Edit frame', 'table' => 'Table Settings', 'rate' => 'Rate', 'settings' => 'Settings'];
 ?><!doctype html>
 <html lang="en">
 <head>
@@ -842,6 +1264,10 @@ body {
   color: var(--text);
   font: 15px/1.5 var(--font-ui);
   -webkit-font-smoothing: antialiased;
+  /* Safety net: nothing on the page is meant to scroll it sideways — an element that's too wide
+     for a narrow screen (a select with long option text, a dense editor grid, etc.) should scroll
+     within itself (several already do via their own overflow-x: auto), not stretch the whole page. */
+  overflow-x: hidden;
 }
 a { color: inherit; }
 button, input, select, textarea { font: inherit; color: inherit; }
@@ -882,6 +1308,7 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
 
 .wrap { max-width: 1240px; margin: 0 auto; padding: clamp(20px, 4vw, 40px) clamp(16px, 3vw, 32px) 120px; }
 .page-head { display: flex; align-items: end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.75rem; }
+.page-head__actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .page-head h1 { font-family: var(--font-display); font-size: clamp(2rem, 4vw, 2.75rem); line-height: 1.05; letter-spacing: -0.015em; }
 .page-head p { margin: 0.35rem 0 0; color: var(--muted); }
 .back { display: inline-block; margin-bottom: 0.6rem; color: var(--muted); text-decoration: none; font-size: 0.875rem; }
@@ -902,6 +1329,8 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
 .btn--ghost:hover { background: var(--panel-2); color: var(--text); border-color: transparent; }
 .btn--danger { color: var(--danger); }
 .btn--danger:hover { background: rgba(232, 128, 111, 0.12); border-color: rgba(232, 128, 111, 0.4); }
+.btn--danger-solid { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+.btn--danger-solid:hover { background: #d96a57; border-color: #d96a57; }
 .btn--success { background: #22a855; border-color: #22a855; color: #fff; font-weight: 600; }
 .btn--success:hover { background: #1c8f47; border-color: #1c8f47; }
 .theme-field { display: flex; align-items: center; gap: 0.5rem; }
@@ -980,6 +1409,9 @@ h1, h2, h3 { margin: 0; font-weight: 400; }
 .panel + .panel { margin-top: 1rem; }
 .panel h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; }
 .panel h2 small { font-weight: 400; color: var(--muted); margin-left: 0.4rem; font-size: 0.875rem; }
+.panel__head-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; }
+.panel__head-row h2 { margin-bottom: 0; }
+.panel__head-row + [data-tags-body] { margin-top: 1rem; }
 .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 1rem; }
 .row + .row, .row + .field, .field + .row, .field + .field, .check + .row, .row + .check { margin-top: 1rem; }
 .field { display: grid; gap: 0.35rem; min-width: 0; }
@@ -1026,7 +1458,7 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 
 /* ---------- Table editor ---------- */
 .table-editor { margin-top: 1rem; }
-.table-editor__grid { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
+.table-editor__grid { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 .table-editor__grid table { border-collapse: collapse; width: 100%; }
 .table-editor__grid td { padding: 2px; border: 1px solid var(--line); vertical-align: middle; }
 .table-editor__grid input {
@@ -1067,6 +1499,20 @@ button.table-editor__swatch {
 .tag-row { display: flex; align-items: end; gap: 0.5rem; }
 .tag-row form:first-child { flex: 1; display: flex; align-items: end; gap: 0.5rem; }
 .tag-row .field { flex: 1; min-width: 0; }
+.label-row {
+  display: flex; flex-wrap: wrap; align-items: end; gap: 0.6rem;
+  padding: 0.75rem; margin-bottom: 0.6rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 10px;
+}
+.label-row__text { flex: 1 1 220px; min-width: 160px; }
+.label-row__text input { width: 100%; }
+.label-row select, .label-row input[type=number] { width: auto; min-width: 0; }
+.label-row input[type=number] { width: 70px; }
+.label-row input[type=color] { width: 36px; height: 36px; min-height: 36px; padding: 2px; border: 1px solid var(--line-2); border-radius: 8px; background: var(--bg); cursor: pointer; }
+.label-row__remove {
+  display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0;
+  background: none; border: 0; border-radius: 50%; color: var(--muted); cursor: pointer; font-size: 1.25rem; line-height: 1;
+}
+.label-row__remove:hover { background: var(--panel); color: var(--danger); }
 
 /* ---------- Tags table (Table Settings) ---------- */
 .tags-table { width: 100%; border-collapse: collapse; }
@@ -1083,6 +1529,20 @@ button.table-editor__swatch {
 .tags-table__new td { padding-top: 0.75rem; }
 .user-block { padding-bottom: 1rem; margin-bottom: 1rem; border-bottom: 1px solid var(--line); }
 .user-block__reset { margin-top: 0.6rem; }
+
+/* ---------- Rate table ---------- */
+.rate-table-wrap { overflow-x: auto; margin: 1rem 0; }
+.rate-table { border-collapse: collapse; white-space: nowrap; }
+.rate-table th, .rate-table td { padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+.rate-table th { font-size: 0.75rem; font-weight: 600; color: var(--muted); white-space: nowrap; }
+.rate-table tr:last-child td { border-bottom: none; }
+.rate-table output { font-weight: 600; color: var(--accent); }
+.rate-table .rate-label-input { width: 80px; min-height: auto; padding: 0.4rem 0.5rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px; }
+.rate-table .rate-pct-input { width: 70px; min-height: auto; padding: 0.4rem 0.5rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px; }
+.rate-table .rate-cell { display: flex; flex-direction: column; gap: 0.3rem; }
+.rate-table .rate-amt-input { width: 70px; min-height: auto; padding: 0.4rem 0.5rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px; }
+.rate-table .rate-mode { display: flex; align-items: center; gap: 0.3rem; font-size: 0.7rem; color: var(--muted); white-space: nowrap; font-weight: 400; }
+.rate-table input:disabled { opacity: 0.4; }
 
 /* ---------- Image field ---------- */
 /* Visually hidden rather than display:none — some mobile browsers won't open the native file
@@ -1161,10 +1621,13 @@ dialog {
   box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); }
-#unsavedDialog { width: min(420px, calc(100vw - 32px)); padding: 1.25rem; }
-#unsavedDialog h2 { font-family: var(--font-display); font-size: 1.3rem; font-weight: 400; margin-bottom: 0.5rem; }
-#unsavedDialog p { color: var(--muted); margin: 0; }
+#unsavedDialog, #confirmDialog, #referralInvalidModal { width: min(420px, calc(100vw - 32px)); padding: 1.25rem; }
+#unsavedDialog h2, #confirmDialog h2, #referralInvalidModal h2 { font-family: var(--font-display); font-size: 1.3rem; font-weight: 400; margin-bottom: 0.5rem; }
+#unsavedDialog p, #confirmDialog p, #referralInvalidModal p { color: var(--muted); margin: 0; }
 .unsaved__actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.25rem; }
+#rateDialog { width: min(420px, calc(100vw - 32px)); padding: 1.25rem; }
+#rateDialog h2 { font-family: var(--font-display); font-size: 1.3rem; font-weight: 400; margin-bottom: 0.5rem; }
+#rateDialog p { color: var(--muted); margin: 0 0 1rem; }
 .lib__head { position: sticky; top: 0; display: flex; align-items: center; justify-content: space-between; padding: 0.9rem 1.1rem; background: var(--panel); border-bottom: 1px solid var(--line); z-index: 1; }
 .lib__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; padding: 1.1rem; }
 .lib__item { display: grid; gap: 0.4rem; padding: 0; background: none; border: 0; text-align: left; cursor: pointer; }
@@ -1214,19 +1677,42 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
 .pay__icon { width: 56px; height: 56px; margin: 0 auto 1rem; display: grid; place-items: center; border-radius: 50%; background: rgba(255, 45, 143, 0.12); font-size: 1.6rem; }
 .pay__actions { display: grid; gap: 0.6rem; margin-top: 1rem; }
 .pay__actions .btn { width: 100%; }
-.pay__qr { display: flex; justify-content: center; margin-bottom: 0.75rem; }
-.pay__qr > div { width: 186px; height: 186px; background: #fff; border-radius: 10px; padding: 8px; display: flex; align-items: center; justify-content: center; }
-.pay__upi strong { color: var(--text); }
 .pay__error { color: #ff6b6b; font-size: 0.8125rem; margin: -0.5rem 0 0.75rem; }
 
 /* ---------- Auth ---------- */
-.auth { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; background: var(--auth-grad); }
+.auth {
+  min-height: 100vh; display: grid; place-items: center; padding: 24px 16px;
+  background: var(--auth-grad);
+}
+/* Matches NexShow.php's own device-login screen: cosmic blue/purple gradient, frosted-glass
+   card, gradient pill button — scoped entirely to .auth so the rest of the dashboard (Frames,
+   Table Settings, Settings) keeps its usual look untouched. Light mode keeps its own warm
+   cream gradient (see :root[data-theme="light"] below) rather than this dark cosmic one. */
+:root:not([data-theme="light"]) .auth {
+  --auth-grad:
+    radial-gradient(60% 50% at 80% 12%, rgba(155, 47, 224, 0.38), transparent 60%),
+    radial-gradient(55% 45% at 10% 90%, rgba(25, 167, 255, 0.28), transparent 60%),
+    linear-gradient(165deg, #0a0d1c 0%, #0c1130 55%, #140a28 100%);
+  --accent: #19a7ff;
+  --btn-primary: linear-gradient(90deg, #19a7ff, #9b2fe0);
+  --btn-primary-hover: linear-gradient(90deg, #3bb4ff, #ad4bf0);
+  --btn-primary-ink: #ffffff;
+}
+:root:not([data-theme="light"]) .auth .panel {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
 .auth__card { width: min(400px, 100%); text-align: center; }
 .auth__logo { width: 160px; height: 160px; margin: 0 auto 1.25rem; display: block; }
+:root:not([data-theme="light"]) .auth__logo { filter: drop-shadow(0 8px 30px rgba(155, 47, 224, 0.45)); }
+.auth__kicker { margin: -0.75rem 0 1rem; color: var(--accent); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.12em; }
 .auth__card h1 { font-family: var(--font-display); font-size: 1.85rem; letter-spacing: -0.015em; margin-bottom: 0.4rem; }
 .auth__card > p { margin: 0 0 1.5rem; color: var(--muted); }
 .auth__card .field { text-align: left; }
 .auth__card .btn { width: 100%; margin-top: 1.25rem; }
+.auth__card input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .auth-forgot { display: block; margin-top: 0.6rem; text-align: right; font-size: 0.8125rem; color: var(--muted); text-decoration: none; }
 .auth-forgot:hover { color: var(--text); }
 
@@ -1245,7 +1731,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
   .top__right { gap: 0.35rem; margin-left: auto; }
   .top__right .btn span { display: none; }
   .savebar__status { display: none; }
-  .savebar__inner .btn { flex: 1; }
+  .savebar__inner .btn { flex: 1; min-width: 0; }
   /* Below ~640px the pill-link nav becomes a fixed bottom tab bar, icon over label — each item is
      an equal-width column, pinned under everything else on screen. The savebar (on the frame-edit
      and Table Settings pages) stacks just above it instead of at the very bottom, so the two
@@ -1258,16 +1744,31 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.65); backdrop-filter: blur(3px); 
     border-top: 1px solid var(--line);
   }
   .nav a {
-    flex: 1; flex-direction: column; justify-content: center; gap: 0.15rem;
-    padding: 0.4rem 0.25rem; border: none; border-radius: 0;
-    font-size: 0.6875rem; text-align: center;
+    flex: 1; min-width: 0; flex-direction: column; justify-content: center; gap: 0.15rem;
+    padding: 0.4rem 0.2rem; border: none; border-radius: 0;
+    font-size: 0.625rem; text-align: center;
   }
   .nav a:hover { background: none; border-color: transparent; }
   .nav a[aria-current] { background: none; border-color: transparent; color: var(--accent); }
   .nav__icon { display: block; }
   .nav__icon svg { margin: 0 auto; }
+  /* "Table Settings" is the longest label of the four tabs — min-width: 0 above lets each tab
+     shrink to an equal quarter of the bar instead of each refusing to go below its own natural
+     content width (the classic flex overflow trap), and this wraps that one label onto two lines
+     rather than letting it force the tab wider than its share. */
+  .nav__label { display: block; overflow-wrap: break-word; line-height: 1.15; }
   .wrap { padding-bottom: calc(120px + var(--bottom-nav-h)); }
   .savebar { bottom: var(--bottom-nav-h); padding-bottom: 0.75rem; }
+  .page-head__actions { width: 100%; }
+  .page-head__actions .btn { flex: 1; }
+  /* The rate table is inherently wide (label + 4 percent/computed-value column pairs) — rather
+     than squeezing 9 columns to fit a phone screen unreadably, it scrolls horizontally there
+     (.rate-table-wrap already has overflow-x: auto); this just shrinks the touch targets enough
+     that more of it is visible at once without needing to scroll as far. */
+  .rate-table th, .rate-table td { padding: 0.4rem 0.4rem; font-size: 0.8125rem; }
+  .rate-table .rate-label-input { width: 64px; }
+  .rate-table .rate-pct-input { width: 56px; }
+  .rate-table .rate-amt-input { width: 56px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; }
@@ -1300,14 +1801,20 @@ document.addEventListener('DOMContentLoaded', function () {
   });
 });
 </script>
-<?php if (in_array($view, ['register', 'login', 'forgot', 'reset'], true)): ?>
+<?php if (in_array($view, ['register', 'login', 'forgot', 'reset', 'verify_email'], true)): ?>
 <main class="auth">
   <form class="auth__card panel" method="post" action="admin.php">
     <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
     <img class="auth__logo" src="images/nexshow-logo.png" alt="NexShoW">
+    <p class="auth__kicker">ADMIN</p>
     <?php if ($view === 'register'): ?>
       <input type="hidden" name="action" value="register">
       <h1 style="text-transform: uppercase">Register</h1>
+    <?php elseif ($view === 'verify_email'): ?>
+      <input type="hidden" name="action" value="verify_registration">
+      <h1>Verify your email</h1>
+      <p>We sent a 6-digit code to <strong><?= e($_SESSION['xs_pending_reg']['email'] ?? '') ?></strong>. Enter it below to finish registering.</p>
+      <?php if (xs_is_localhost()): ?><p class="hint">Local testing: no mail server here, so <code>226699</code> always works.</p><?php endif; ?>
     <?php elseif ($view === 'forgot'): ?>
       <input type="hidden" name="action" value="forgot_password">
       <h1>Forgot password</h1>
@@ -1331,7 +1838,11 @@ document.addEventListener('DOMContentLoaded', function () {
       <label class="field"><span>Username</span><input type="text" name="username" required<?= $view !== 'register' ? ' autofocus' : '' ?> autocomplete="username" maxlength="80"></label>
     <?php endif; ?>
     <?php if ($view === 'register'): ?>
-      <label class="field"><span>Email</span><input type="email" name="email" autocomplete="email" maxlength="190"></label>
+      <label class="field"><span>Email <em>we'll send a code to verify it</em></span><input type="email" name="email" required autocomplete="email" maxlength="190"></label>
+      <label class="field"><span>Referral code <em>optional</em></span><input type="text" name="referralCode" maxlength="32" autocapitalize="characters"></label>
+    <?php endif; ?>
+    <?php if ($view === 'verify_email'): ?>
+      <label class="field"><span>Verification code</span><input type="text" name="otp" required autofocus inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code" placeholder="123456"></label>
     <?php endif; ?>
     <?php if ($view === 'login' || $view === 'register' || $view === 'reset'): ?>
       <label class="field"><span><?= $view === 'reset' ? 'New password' : 'Password' ?></span><input type="password" name="password" required autocomplete="<?= $view === 'login' ? 'current-password' : 'new-password' ?>"<?= $view !== 'login' ? ' minlength="8"' : '' ?>></label>
@@ -1342,11 +1853,20 @@ document.addEventListener('DOMContentLoaded', function () {
     <?php if ($view === 'login'): ?>
       <a class="auth-forgot" href="admin.php?view=forgot">Forgot password?</a>
     <?php endif; ?>
-    <button class="btn btn--primary" type="submit"><?= ['register' => 'Register', 'forgot' => 'Send reset link', 'reset' => 'Reset password'][$view] ?? 'Log in' ?></button>
+    <button class="btn btn--primary" type="submit"><?= ['register' => 'Register', 'verify_email' => 'Verify & finish registering', 'forgot' => 'Send reset link', 'reset' => 'Reset password'][$view] ?? 'Log in' ?></button>
   </form>
+  <?php if ($view === 'verify_email'): ?>
+    <form method="post" action="admin.php" style="text-align:center;margin-top:1rem">
+      <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+      <input type="hidden" name="action" value="resend_registration_otp">
+      <button class="btn btn--sm btn--ghost" type="submit">Resend code</button>
+    </form>
+  <?php endif; ?>
   <p style="text-align:center;margin-top:1rem;color:var(--muted);font-size:0.875rem">
     <?php if ($view === 'register'): ?>
       Already have an account? <a href="admin.php?view=login">Log in</a>
+    <?php elseif ($view === 'verify_email'): ?>
+      Wrong email? <a href="admin.php?view=register">Start over</a>
     <?php elseif ($view === 'forgot' || $view === 'reset'): ?>
       <a href="admin.php?view=login">Back to log in</a>
     <?php else: ?>
@@ -1361,6 +1881,7 @@ document.addEventListener('DOMContentLoaded', function () {
   <nav class="nav">
     <a href="admin.php"<?= ($view === 'frames' || $view === 'edit') ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"></rect><path d="M3 15l4.5-4.5a1.5 1.5 0 0 1 2.12 0L14 14.9"></path><path d="M13.5 13.4 16 10.9a1.5 1.5 0 0 1 2.12 0L21 13.8"></path><circle cx="8" cy="8.5" r="1.3"></circle></svg></span><span class="nav__label">Frames</span></a>
     <a href="admin.php?view=table"<?= $view === 'table' ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18"></path><path d="M9 10v10"></path></svg></span><span class="nav__label">Table Settings</span></a>
+    <a href="admin.php?view=rate"<?= $view === 'rate' ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v10"></path><path d="M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1.1-3 2.5 1.3 2 3 2.5 3 1.1 3 2.5-1.3 2.5-3 2.5-3-1.1-3-2.5"></path></svg></span><span class="nav__label">Rate</span></a>
     <a href="admin.php?view=settings"<?= $view === 'settings' ? ' aria-current="page"' : '' ?>><span class="nav__icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 13.5a7.97 7.97 0 0 0 0-3l2-1.4-2-3.46-2.3.9a7.9 7.9 0 0 0-2.6-1.5L14 2.5h-4l-.5 2.54a7.9 7.9 0 0 0-2.6 1.5l-2.3-.9-2 3.46 2 1.4a7.97 7.97 0 0 0 0 3l-2 1.4 2 3.46 2.3-.9c.77.65 1.65 1.16 2.6 1.5L10 21.5h4l.5-2.54a7.9 7.9 0 0 0 2.6-1.5l2.3.9 2-3.46z"></path></svg></span><span class="nav__label">Settings</span></a>
   </nav>
   <div class="top__right">
@@ -1385,18 +1906,70 @@ document.addEventListener('DOMContentLoaded', function () {
   </div>
 </dialog>
 
+<dialog id="confirmDialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Are you sure?</h2>
+  <p data-confirm-message></p>
+  <div class="unsaved__actions">
+    <button class="btn btn--ghost" type="button" data-confirm-cancel>Cancel</button>
+    <button class="btn btn--danger" type="button" data-confirm-ok>Continue</button>
+  </div>
+</dialog>
+
 <main class="wrap">
 <?php if ($flash): ?><div class="flash flash--<?= e($flash[0]) ?>" role="status"><?= e($flash[1]) ?></div><?php endif; ?>
 <?php if (!$dbOk): ?><div class="flash flash--error" role="status">Could not reach the database. Frames shown below may be out of date, and nothing can be added, edited or deleted right now.</div><?php endif; ?>
 
-<?php if ($view === 'frames'): ?>
+<?php if ($view === 'frames'):
+    $curRateConfig = !empty($settings['rateConfig']) ? json_decode($settings['rateConfig'], true) : null;
+    $curStandardRate = is_array($curRateConfig) ? (float) ($curRateConfig['standardRate'] ?? 0) : 0;
+    $curSilverStandardRate = is_array($curRateConfig) ? (float) ($curRateConfig['silverStandardRate'] ?? 0) : 0;
+    $curPlatinumStandardRate = is_array($curRateConfig) ? (float) ($curRateConfig['platinumStandardRate'] ?? 0) : 0;
+?>
   <div class="page-head">
     <div>
       <h1>Frames</h1>
       <p><?= count($frames) ?> frame<?= count($frames) === 1 ? '' : 's' ?>, shown in this order. Each stays on screen for <?= e($defaultSeconds) ?>s unless you set its own time.</p>
     </div>
-    <a class="btn btn--primary" href="admin.php?view=edit">+ Add frame</a>
+    <div class="page-head__actions">
+      <button type="button" class="btn" data-open-rate-dialog>SET RATE</button>
+      <a class="btn btn--primary" href="admin.php?view=edit">+ Add frame</a>
+    </div>
   </div>
+
+  <dialog id="rateDialog" aria-labelledby="rate-dialog-title">
+    <form method="post" action="admin.php">
+      <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+      <input type="hidden" name="action" value="save_standard_rate">
+      <input type="hidden" name="back" value="view=frames">
+      <h2 id="rate-dialog-title">Set today's standard rates</h2>
+      <label class="field"><span>Gold standard rate</span><input type="number" step="0.01" min="0" name="rateStandard" value="<?= e($curStandardRate) ?>" autofocus></label>
+      <label class="field"><span>Silver standard rate</span><input type="number" step="0.01" min="0" name="silverRateStandard" value="<?= e($curSilverStandardRate) ?>"></label>
+      <label class="field"><span>Platinum standard rate</span><input type="number" step="0.01" min="0" name="platinumRateStandard" value="<?= e($curPlatinumStandardRate) ?>"></label>
+      <div class="unsaved__actions">
+        <button class="btn btn--ghost" type="button" data-rate-dialog-close>Cancel</button>
+        <button class="btn btn--primary" type="submit">Save rates</button>
+      </div>
+    </form>
+  </dialog>
+  <script>
+  (function () {
+    var dlg = document.getElementById('rateDialog');
+    if (!dlg) return;
+    document.querySelectorAll('[data-open-rate-dialog]').forEach(function (btn) {
+      btn.addEventListener('click', function () { dlg.showModal(); });
+    });
+    dlg.querySelectorAll('[data-rate-dialog-close]').forEach(function (btn) {
+      btn.addEventListener('click', function () { dlg.close(); });
+    });
+    // Closing on a backdrop click (not just any click landing on the dialog element) — a text
+    // selection that starts inside the form and is dragged outside the dialog's box also fires a
+    // "click" with target === dlg, which would otherwise close the dialog on what's really just a
+    // mouse drag. Only treat it as a backdrop click when the press itself started on the backdrop.
+    var rateBackdropDown = false;
+    dlg.addEventListener('mousedown', function (e) { rateBackdropDown = e.target === dlg; });
+    dlg.addEventListener('click', function (e) { if (e.target === dlg && rateBackdropDown) dlg.close(); });
+  })();
+  </script>
 
   <div class="grid">
   <?php foreach ($frames as $i => $fr):
@@ -1465,10 +2038,16 @@ document.addEventListener('DOMContentLoaded', function () {
 
       <section class="panel">
         <h2>Images</h2>
+        <?php $hasMobileImage = (string) ($raw['mobileImage'] ?? '') !== ''; ?>
         <div class="images">
           <?php xs_image_field('image', 'TV / desktop', 'Photo, or video up to 40 MB', (string) ($raw['image'] ?? ''), 'focalPoint', (string) $f['focalPoint'], true); ?>
-          <?php xs_image_field('mobileImage', 'Phone', 'Optional portrait photo', (string) ($raw['mobileImage'] ?? ''), 'mobileFocalPoint', (string) ($raw['mobileFocalPoint'] ?? '')); ?>
+          <div data-mobile-image-field<?= $hasMobileImage ? '' : ' hidden' ?>>
+            <?php xs_image_field('mobileImage', 'Phone', 'Optional portrait photo', (string) ($raw['mobileImage'] ?? ''), 'mobileFocalPoint', (string) ($raw['mobileFocalPoint'] ?? '')); ?>
+          </div>
         </div>
+        <?php if (!$hasMobileImage): ?>
+          <div class="row" style="margin: 1rem 0"><div><button type="button" class="btn btn--sm" data-mobile-image-toggle>+ Add portrait photo</button></div></div>
+        <?php endif; ?>
         <p class="hint">If the TV / desktop slot is a video, it plays on a loop there (with sound where the browser allows it). The Phone photo (or, if left empty, the same video) is what phones show.</p>
         <div class="row">
           <label class="field"><span>Image description <em>read aloud by screen readers</em></span><input type="text" name="alt" value="<?= e($raw['alt'] ?? '') ?>" maxlength="200"></label>
@@ -1476,17 +2055,20 @@ document.addEventListener('DOMContentLoaded', function () {
         <div class="row">
           <label class="check"><input type="checkbox" name="kenBurns" value="1"<?= $f['kenBurns'] ? ' checked' : '' ?>> Slow zoom on the image while the frame is showing</label>
         </div>
+        <div class="row">
+          <label class="check"><input type="checkbox" name="muteVideo" value="1"<?= $f['muteVideo'] ? ' checked' : '' ?>> Mute video audio <em>only applies if the TV / desktop slot is a video</em></label>
+        </div>
       </section>
 
+      <?php if (!$isNew): ?>
       <section class="panel">
-        <h2>Table <small>one shared data table, built once in <a href="admin.php?view=table">Table Settings</a></small></h2>
-        <div class="row">
-          <label class="check"><input type="checkbox" name="tableEnabled" value="1"<?= !empty($table['enabled']) ? ' checked' : '' ?>> Show the table on this frame</label>
-        </div>
-        <?php if (empty($companyTableBuilt)): ?>
-          <p class="hint">No table has been built yet. <a href="admin.php?view=table">Build it in Table Settings</a>, then come back and check the box above.</p>
-        <?php endif; ?>
+        <h2>Table</h2>
+        <p class="hint">
+          <?= !empty($table['rows']) && !empty($table['enabled']) ? 'This frame has its own table, currently shown.' : (!empty($table['rows']) ? 'This frame has its own table, currently hidden.' : 'This frame has no table yet.') ?>
+          <a href="admin.php?view=table&amp;frame=<?= rawurlencode($editId) ?>"><?= !empty($table['rows']) ? 'Edit it' : 'Build one' ?> in Table Settings</a>.
+        </p>
       </section>
+      <?php endif; ?>
 
       <section class="panel">
         <h2>Text</h2>
@@ -1565,6 +2147,7 @@ document.addEventListener('DOMContentLoaded', function () {
             <label><input type="radio" name="pv" value="tv" checked data-pv><span><?= $tvLabel ?></span></label>
             <label><input type="radio" name="pv" value="phone" data-pv><span>Phone</span></label>
           </div>
+          <?php if (!$isNew): ?><button type="button" class="btn btn--sm" data-pv-share>Share</button><?php endif; ?>
         </div>
         <?php if ($isNew): ?>
           <div class="preview__empty">Save the frame to see a preview.</div>
@@ -1641,6 +2224,109 @@ document.addEventListener('DOMContentLoaded', function () {
     </div>
   </dialog>
 
+<?php elseif ($view === 'rate'):
+    $xs_rate_metals = [
+        ['metal' => 'gold', 'title' => 'Gold', 'namePrefix' => 'rate', 'tagPrefix' => '', 'standardRate' => $rateConfig['standardRate'], 'levels' => $rateConfig['levels'], 'placeholder' => 'e.g. 24K'],
+        ['metal' => 'silver', 'title' => 'Silver', 'namePrefix' => 'silverRate', 'tagPrefix' => 'SILVER', 'standardRate' => $rateConfig['silverStandardRate'], 'levels' => $rateConfig['silverLevels'], 'placeholder' => 'e.g. 999'],
+        ['metal' => 'platinum', 'title' => 'Platinum', 'namePrefix' => 'platinumRate', 'tagPrefix' => 'PLATINUM', 'standardRate' => $rateConfig['platinumStandardRate'], 'levels' => $rateConfig['platinumLevels'], 'placeholder' => 'e.g. Platinum'],
+    ];
+?>
+  <div class="page-head">
+    <div>
+      <h1>Rate</h1>
+      <p>Enter a standard rate for gold, one for silver and one for platinum &mdash; {{PURITYn}}/{{SILVERPURITYn}}/{{PLATINUMPURITYn}} is that level's own Label text, and SALERATE, URRATE and EXCHANGERATE (plus their SILVER and PLATINUM counterparts) compute as amounts from the matching standard rate, ready to use as {{name}} anywhere a tag already works.</p>
+    </div>
+  </div>
+
+  <form method="post" action="admin.php" class="panel">
+    <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+    <input type="hidden" name="action" value="save_rate_config">
+    <input type="hidden" name="back" value="view=rate">
+
+    <?php foreach ($xs_rate_metals as $m): ?>
+    <h2><?= e($m['title']) ?></h2>
+    <div class="row">
+      <label class="field"><span><?= e($m['title']) ?> standard rate</span><input type="number" step="0.01" min="0" name="<?= $m['namePrefix'] ?>Standard" value="<?= e($m['standardRate']) ?>" data-rate-standard="<?= $m['metal'] ?>"></label>
+    </div>
+
+    <div class="rate-table-wrap">
+      <table class="rate-table">
+        <thead>
+          <tr>
+            <th>Level <span class="hint">{{<?= e($m['tagPrefix']) ?>PURITYn}}</span></th>
+            <th>Sale % <span class="hint">or ₹ amount</span></th><th>{{<?= e($m['tagPrefix']) ?>SALERATEn}}</th>
+            <th>UR % <span class="hint">or ₹ amount</span></th><th>{{<?= e($m['tagPrefix']) ?>URRATEn}}</th>
+            <th>Exchange % <span class="hint">or ₹ amount</span></th><th>{{<?= e($m['tagPrefix']) ?>EXCHANGERATEn}}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($m['levels'] as $i => $lvl): $n = $i + 1; ?>
+          <tr>
+            <td><input type="text" name="<?= $m['namePrefix'] ?>Label<?= $n ?>" value="<?= e($lvl['label']) ?>" placeholder="<?= e($m['placeholder']) ?>" maxlength="40" class="rate-label-input"></td>
+            <td class="rate-cell">
+              <label class="rate-mode"><input type="checkbox" name="<?= $m['namePrefix'] ?>SaleUseAmt<?= $n ?>" value="1"<?= !empty($lvl['saleUseAmt']) ? ' checked' : '' ?> data-rate-mode="sale" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>"> ₹ instead of %</label>
+              <input type="number" step="0.001" min="0" name="<?= $m['namePrefix'] ?>SalePct<?= $n ?>" value="<?= e($lvl['salePct']) ?>" placeholder="%" data-rate-pct="sale" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-pct-input">
+              <input type="number" step="0.01" min="0" name="<?= $m['namePrefix'] ?>SaleAmt<?= $n ?>" value="<?= e($lvl['saleAmt']) ?>" placeholder="₹ amount" data-rate-amt="sale" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-amt-input">
+            </td>
+            <td><output data-rate-out="sale" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>">0</output><br><span class="hint">{{<?= e($m['tagPrefix']) ?>SALERATE<?= $n ?>}}</span></td>
+            <td class="rate-cell">
+              <label class="rate-mode"><input type="checkbox" name="<?= $m['namePrefix'] ?>UrUseAmt<?= $n ?>" value="1"<?= !empty($lvl['urUseAmt']) ? ' checked' : '' ?> data-rate-mode="ur" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>"> ₹ instead of %</label>
+              <input type="number" step="0.001" min="0" name="<?= $m['namePrefix'] ?>UrPct<?= $n ?>" value="<?= e($lvl['urPct']) ?>" placeholder="%" data-rate-pct="ur" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-pct-input">
+              <input type="number" step="0.01" min="0" name="<?= $m['namePrefix'] ?>UrAmt<?= $n ?>" value="<?= e($lvl['urAmt']) ?>" placeholder="₹ amount" data-rate-amt="ur" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-amt-input">
+            </td>
+            <td><output data-rate-out="ur" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>">0</output><br><span class="hint">{{<?= e($m['tagPrefix']) ?>URRATE<?= $n ?>}}</span></td>
+            <td class="rate-cell">
+              <label class="rate-mode"><input type="checkbox" name="<?= $m['namePrefix'] ?>ExchangeUseAmt<?= $n ?>" value="1"<?= !empty($lvl['exchangeUseAmt']) ? ' checked' : '' ?> data-rate-mode="exchange" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>"> ₹ instead of %</label>
+              <input type="number" step="0.001" min="0" name="<?= $m['namePrefix'] ?>ExchangePct<?= $n ?>" value="<?= e($lvl['exchangePct']) ?>" placeholder="%" data-rate-pct="exchange" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-pct-input">
+              <input type="number" step="0.01" min="0" name="<?= $m['namePrefix'] ?>ExchangeAmt<?= $n ?>" value="<?= e($lvl['exchangeAmt']) ?>" placeholder="₹ amount" data-rate-amt="exchange" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>" class="rate-amt-input">
+            </td>
+            <td><output data-rate-out="exchange" data-rate-metal="<?= $m['metal'] ?>" data-rate-row="<?= $n ?>">0</output><br><span class="hint">{{<?= e($m['tagPrefix']) ?>EXCHANGERATE<?= $n ?>}}</span></td>
+          </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+    </div>
+    <?php endforeach; ?>
+    <p class="hint">Sale/UR/Exchange are each a straight percentage of that metal's own standard rate by default. Tick "₹ instead of %" to switch that one to a flat amount subtracted from the standard rate instead (e.g. standard rate minus ₹500) — the % field is then ignored for it. The result never goes below 0.</p>
+    <p class="hint">Saving also updates {{RATEDATE}} and {{RATETIME}} to right now — use them in a table to show how fresh the rate on display is.</p>
+
+    <div class="row"><div><button class="btn btn--primary" type="submit">Save rates &amp; update tags</button></div></div>
+  </form>
+
+  <script>
+  (function () {
+    var metals = ['gold', 'silver', 'platinum'];
+    function setOut(metal, kind, n, value) {
+      var out = document.querySelector('[data-rate-out="' + kind + '"][data-rate-metal="' + metal + '"][data-rate-row="' + n + '"]');
+      if (out) out.textContent = value;
+    }
+    function recalcMetal(metal) {
+      var standardInput = document.querySelector('[data-rate-standard="' + metal + '"]');
+      if (!standardInput) return;
+      var standard = parseFloat(standardInput.value) || 0;
+      ['sale', 'ur', 'exchange'].forEach(function (kind) {
+        document.querySelectorAll('[data-rate-pct="' + kind + '"][data-rate-metal="' + metal + '"]').forEach(function (pctInput) {
+          var n = pctInput.getAttribute('data-rate-row');
+          var amtInput = document.querySelector('[data-rate-amt="' + kind + '"][data-rate-metal="' + metal + '"][data-rate-row="' + n + '"]');
+          var modeInput = document.querySelector('[data-rate-mode="' + kind + '"][data-rate-metal="' + metal + '"][data-rate-row="' + n + '"]');
+          var useAmt = !!(modeInput && modeInput.checked);
+          pctInput.disabled = useAmt;
+          if (amtInput) amtInput.disabled = !useAmt;
+          var pct = parseFloat(pctInput.value) || 0;
+          var amt = amtInput ? (parseFloat(amtInput.value) || 0) : 0;
+          var value = useAmt ? (standard - amt) : (standard * pct / 100);
+          setOut(metal, kind, n, Math.max(0, Math.round(value)));
+        });
+      });
+    }
+    function recalcAll() { metals.forEach(recalcMetal); }
+    document.querySelectorAll('[data-rate-pct], [data-rate-amt], [data-rate-mode], [data-rate-standard]').forEach(function (el) {
+      el.addEventListener('input', recalcAll);
+      el.addEventListener('change', recalcAll);
+    });
+    recalcAll();
+  })();
+  </script>
 <?php elseif ($view === 'settings'):
     $unused = count(array_filter($library, function ($it) { return !$it['used'] && xs_is_frame_file($it['value']); }));
     $companyUsers = $canManageUsers ? xs_db_list_company_users($companyId) : [];
@@ -1687,7 +2373,7 @@ document.addEventListener('DOMContentLoaded', function () {
               ?></span>
             </div>
             <?php if ($needsPayment): ?>
-              <button class="btn btn--sm btn--success" type="button" data-pay-user="<?= e($u['username']) ?>">Pay to activate</button>
+              <button class="btn btn--sm btn--success" type="button" data-pay-user-id="<?= (int) $u['id'] ?>" data-pay-username="<?= e($u['username']) ?>">Pay to activate</button>
             <?php elseif (!$isSelf): ?>
             <form method="post" action="admin.php">
               <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
@@ -1695,7 +2381,7 @@ document.addEventListener('DOMContentLoaded', function () {
               <input type="hidden" name="back" value="view=settings">
               <input type="hidden" name="userId" value="<?= (int) $u['id'] ?>">
               <input type="hidden" name="status" value="<?= $u['status'] === 'active' ? 'inactive' : 'active' ?>">
-              <button class="btn btn--sm<?= $u['status'] === 'active' ? ' btn--danger' : '' ?>" type="submit"><?= $u['status'] === 'active' ? 'Deactivate' : 'Reactivate' ?></button>
+              <button class="btn btn--sm <?= $u['status'] === 'active' ? 'btn--danger-solid' : 'btn--success' ?>" type="submit"><?= $u['status'] === 'active' ? 'Deactivate' : 'Re-Activate' ?></button>
             </form>
             <?php endif; ?>
           </div>
@@ -1724,105 +2410,154 @@ document.addEventListener('DOMContentLoaded', function () {
   </section>
 
   <dialog id="payModal" aria-labelledby="pay-title">
-    <div data-pay-screen="info">
-      <div class="pay__icon">⚠️</div>
-      <h2 id="pay-title">Activate <span data-pay-username></span></h2>
-      <p>This user needs a one-time activation payment of <strong>&#8377;1,999</strong> before it can sign in.</p>
-      <div class="pay__actions">
-        <button class="btn btn--primary" type="button" data-pay-next="pay">Make Payment</button>
-        <a class="btn btn--ghost" href="https://wa.me/919309250445" target="_blank" rel="noopener">WhatsApp Support</a>
-        <button class="btn btn--ghost" type="button" data-close>Close</button>
-      </div>
-    </div>
-    <div data-pay-screen="pay" hidden>
-      <h2>Pay &#8377;1,999</h2>
-      <p>Scan the QR code or use the UPI ID below, then let us know once you've paid.</p>
-      <div class="pay__qr"><div id="payQr"></div></div>
-      <p class="pay__upi">UPI ID: <strong>7385250853@yapl</strong></p>
-      <div class="pay__actions">
-        <a class="btn btn--primary" id="payUpiBtn" href="#">Pay via UPI App</a>
-        <button class="btn btn--success" type="button" data-pay-next="confirm">I've Paid, Notify Support</button>
-      </div>
-    </div>
-    <div data-pay-screen="confirm" hidden>
-      <h2>Confirm payment</h2>
-      <p>Enter the transaction/reference ID from your payment app so we can verify it.</p>
-      <label class="field"><span>Transaction ID</span><input type="text" id="payTxnId" placeholder="e.g. 123456789012" autocomplete="off"></label>
-      <p class="pay__error" id="payTxnError" hidden>Enter your transaction ID.</p>
-      <div class="pay__actions">
-        <button class="btn btn--success" type="button" id="paySubmit">Submit &amp; Notify Support</button>
-      </div>
+    <div class="pay__icon">⚠️</div>
+    <h2 id="pay-title">Activate <span data-pay-username></span></h2>
+    <p>This user needs a one-time activation payment of <strong>&#8377;,3999</strong> before it can sign in. You'll pay through Razorpay — on success, the account activates automatically for one year.</p>
+    <label class="field"><span>Referral code <em>optional</em></span><input type="text" data-pay-referral maxlength="32" autocapitalize="characters"></label>
+    <p class="pay__error" data-pay-error hidden></p>
+    <div class="pay__actions">
+      <button class="btn btn--primary" type="button" data-pay-start>Make Payment</button>
+      <a class="btn btn--ghost" href="https://wa.me/919309250445" target="_blank" rel="noopener">WhatsApp Support</a>
+      <button class="btn btn--ghost" type="button" data-close>Close</button>
     </div>
   </dialog>
-  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+
+  <dialog id="referralInvalidModal" aria-labelledby="referral-invalid-title">
+    <h2 id="referral-invalid-title">Referral code not found</h2>
+    <p>That referral code doesn't exist. You can fix it, or continue without one.</p>
+    <div class="unsaved__actions">
+      <button class="btn btn--ghost" type="button" data-referral-edit>Edit code</button>
+      <button class="btn btn--primary" type="button" data-referral-skip>Continue without referral</button>
+    </div>
+  </dialog>
+
+  <!-- Razorpay's checkout handler fills these in and submits, same as any other action form here
+       — the server (razorpay_verify_payment) is what actually trusts/verifies the result, never
+       the fact that this callback merely fired. -->
+  <form id="razorpayVerifyForm" method="post" action="admin.php" class="visually-hidden">
+    <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
+    <input type="hidden" name="action" value="razorpay_verify_payment">
+    <input type="hidden" name="back" value="view=settings">
+    <input type="hidden" name="userId" data-rp-user-id>
+    <input type="hidden" name="razorpayOrderId" data-rp-order-id>
+    <input type="hidden" name="razorpayPaymentId" data-rp-payment-id>
+    <input type="hidden" name="razorpaySignature" data-rp-signature>
+  </form>
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
   <script>
   (function () {
     var dlg = document.getElementById('payModal');
     if (!dlg) return;
-    var UPI_ID = '7385250853@yapl';
-    var PAYEE_NAME = 'AB Studio Digital';
-    var AMOUNT = 1999;
-    var WHATSAPP = '917385250853';
-    var companyName = <?= json_encode($company['name'] ?? '', JSON_HEX_TAG | JSON_HEX_AMP) ?>;
-    var currentUsername = '';
+    var verifyForm = document.getElementById('razorpayVerifyForm');
+    var errorEl = dlg.querySelector('[data-pay-error]');
+    var startBtn = dlg.querySelector('[data-pay-start]');
+    var referralInput = dlg.querySelector('[data-pay-referral]');
+    var referralDlg = document.getElementById('referralInvalidModal');
+    var csrf = <?= json_encode($csrf, JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+    var currentUserId = null;
 
-    function showScreen(name) {
-      dlg.querySelectorAll('[data-pay-screen]').forEach(function (el) {
-        el.hidden = el.dataset.payScreen !== name;
-      });
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.hidden = false;
     }
 
-    function openFor(username) {
-      currentUsername = username;
+    function openFor(userId, username) {
+      currentUserId = userId;
+      errorEl.hidden = true;
+      referralInput.value = '';
       dlg.querySelectorAll('[data-pay-username]').forEach(function (el) { el.textContent = username; });
-      showScreen('info');
       if (typeof dlg.showModal === 'function') dlg.showModal();
     }
 
-    function buildUpiLink() {
-      var note = encodeURIComponent('Activate user ' + currentUsername);
-      return 'upi://pay?pa=' + UPI_ID + '&pn=' + encodeURIComponent(PAYEE_NAME) + '&am=' + AMOUNT + '&cu=INR&tn=' + note;
+    function resetStartBtn() {
+      startBtn.disabled = false;
+      startBtn.textContent = 'Make Payment';
     }
 
-    dlg.querySelectorAll('[data-pay-next]').forEach(function (btn) {
-      btn.addEventListener('click', function () {
-        var next = btn.dataset.payNext;
-        showScreen(next);
-        if (next === 'pay') {
-          var link = buildUpiLink();
-          document.getElementById('payUpiBtn').href = link;
-          var qrEl = document.getElementById('payQr');
-          qrEl.innerHTML = '';
-          if (window.QRCode) new QRCode(qrEl, { text: link, width: 170, height: 170, colorDark: '#000000', colorLight: '#ffffff' });
-        }
-      });
-    });
+    function startPayment() {
+      errorEl.hidden = true;
+      startBtn.disabled = true;
+      startBtn.textContent = 'Starting…';
+      var body = new URLSearchParams();
+      body.set('csrf', csrf);
+      body.set('action', 'razorpay_create_order');
+      body.set('userId', currentUserId);
+      body.set('referralCode', referralInput.value.trim());
+      fetch('admin.php', { method: 'POST', body: body, credentials: 'same-origin' })
+        .then(function (res) {
+          return res.json().then(function (data) { return { ok: res.ok, data: data }; });
+        })
+        .then(function (result) {
+          resetStartBtn();
+          if (!result.ok) {
+            if (result.data && result.data.invalidReferral) {
+              if (typeof referralDlg.showModal === 'function') referralDlg.showModal();
+              return;
+            }
+            showError(result.data.error || 'Could not start the payment.');
+            return;
+          }
+          var data = result.data;
+          var rzp = new Razorpay({
+            key: data.keyId,
+            amount: data.amount,
+            currency: 'INR',
+            name: data.companyName || 'NexShoW',
+            description: 'Activate ' + data.username,
+            order_id: data.orderId,
+            handler: function (response) {
+              verifyForm.querySelector('[data-rp-user-id]').value = currentUserId;
+              verifyForm.querySelector('[data-rp-order-id]').value = response.razorpay_order_id;
+              verifyForm.querySelector('[data-rp-payment-id]').value = response.razorpay_payment_id;
+              verifyForm.querySelector('[data-rp-signature]').value = response.razorpay_signature;
+              verifyForm.submit();
+            },
+            modal: {
+              // Cancelled the Razorpay widget without paying — bring our own dialog back so
+              // they're not just left looking at the Settings page with nothing explaining why.
+              ondismiss: function () { if (typeof dlg.showModal === 'function') dlg.showModal(); },
+            },
+          });
+          rzp.on('payment.failed', function (resp) {
+            showError('Payment failed: ' + (resp.error && resp.error.description ? resp.error.description : 'please try again.'));
+            if (typeof dlg.showModal === 'function') dlg.showModal();
+          });
+          dlg.close();
+          rzp.open();
+        })
+        .catch(function () {
+          resetStartBtn();
+          showError('Could not reach the server. Check your connection and try again.');
+        });
+    }
 
-    var txnInput = document.getElementById('payTxnId');
-    var txnError = document.getElementById('payTxnError');
-    document.getElementById('paySubmit').addEventListener('click', function () {
-      var value = txnInput.value.trim();
-      if (!value) { txnError.hidden = false; return; }
-      txnError.hidden = true;
-      var message = "Hi, I've paid to activate a user.\nCompany: " + companyName +
-        '\nUsername: ' + currentUsername + '\nAmount: ₹' + AMOUNT + '\nTransaction ID: ' + value;
-      window.open('https://wa.me/' + WHATSAPP + '?text=' + encodeURIComponent(message), '_blank');
-      dlg.close();
-      txnInput.value = '';
+    startBtn.addEventListener('click', startPayment);
+
+    referralDlg.querySelector('[data-referral-edit]').addEventListener('click', function () {
+      referralDlg.close();
+      referralInput.focus();
     });
-    txnInput.addEventListener('input', function () { txnError.hidden = true; });
+    referralDlg.querySelector('[data-referral-skip]').addEventListener('click', function () {
+      referralDlg.close();
+      referralInput.value = '';
+      startPayment();
+    });
 
     dlg.querySelectorAll('[data-close]').forEach(function (btn) {
       btn.addEventListener('click', function () { dlg.close(); });
     });
-    dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+    // See the Rate dialog's identical comment: only a press-and-release both landing on the
+    // backdrop counts as a backdrop click, so dragging a selection out of the form doesn't close it.
+    var payBackdropDown = false;
+    dlg.addEventListener('mousedown', function (e) { payBackdropDown = e.target === dlg; });
+    dlg.addEventListener('click', function (e) { if (e.target === dlg && payBackdropDown) dlg.close(); });
 
-    document.querySelectorAll('[data-pay-user]').forEach(function (btn) {
-      btn.addEventListener('click', function () { openFor(btn.dataset.payUser); });
+    document.querySelectorAll('[data-pay-user-id]').forEach(function (btn) {
+      btn.addEventListener('click', function () { openFor(btn.dataset.payUserId, btn.dataset.payUsername); });
     });
 
     <?php if ($activateUser): ?>
-    openFor(<?= json_encode($activateUser['username'], JSON_HEX_TAG | JSON_HEX_AMP) ?>);
+    openFor(<?= (int) $activateUser['id'] ?>, <?= json_encode($activateUser['username'], JSON_HEX_TAG | JSON_HEX_AMP) ?>);
     <?php endif; ?>
   })();
   </script>
@@ -1839,7 +2574,6 @@ document.addEventListener('DOMContentLoaded', function () {
     </div>
     <div class="row">
       <label class="check"><input type="checkbox" name="autoplay" value="1"<?= $settings['autoplay'] ? ' checked' : '' ?>> Move to the next frame automatically</label>
-      <label class="check"><input type="checkbox" name="pauseOnHover" value="1"<?= $settings['pauseOnHover'] ? ' checked' : '' ?>> Pause while the mouse is over the slider</label>
     </div>
     <div class="row">
       <label class="field"><span>Seconds per frame</span><input type="number" name="duration" min="1" max="60" step="0.5" value="<?= e($defaultSeconds) ?>"></label>
@@ -1894,19 +2628,54 @@ document.addEventListener('DOMContentLoaded', function () {
   <div class="page-head">
     <div>
       <h1>Table Settings</h1>
-      <p>One shared data table &mdash; build it here once, then switch it on from any frame's own Table panel.</p>
+      <p>Pick a frame below to build and edit its own table &mdash; rows, colors and position are all independent per frame. Tags are the one thing shared everywhere.</p>
     </div>
   </div>
 
+  <?php if ($frames): ?>
+  <section class="panel">
+    <label class="field"><span>Frame</span>
+      <select data-table-frame-select>
+        <option value="">Choose a frame&hellip;</option>
+        <?php foreach ($frames as $fr): ?>
+          <option value="<?= e($fr['id']) ?>"<?= $fr['id'] === $tableFrameId ? ' selected' : '' ?>><?= e($fr['title'] ?? $fr['id']) ?></option>
+        <?php endforeach; ?>
+      </select>
+    </label>
+  </section>
+  <?php else: ?>
+    <p class="hint">Add a frame first, then come back here to build its table.</p>
+  <?php endif; ?>
+
+  <?php if ($tableFrameIdx >= 0): ?>
   <div class="edit edit--table">
     <form id="frame-form" method="post" action="admin.php">
       <input type="hidden" name="csrf" value="<?= e($csrf) ?>">
-      <input type="hidden" name="action" value="save_company_table">
-      <input type="hidden" name="back" value="view=table">
+      <input type="hidden" name="action" value="save_frame_table">
+      <input type="hidden" name="back" value="view=table&amp;frame=<?= e($tableFrameId) ?>">
+      <input type="hidden" name="frameId" value="<?= e($tableFrameId) ?>">
 
       <section class="panel">
-        <h2>Table <small>shown on any frame with "Show the table on this frame" checked</small></h2>
+        <h2>Table <small>for "<?= e($frames[$tableFrameIdx]['title'] ?? $tableFrameId) ?>" only</small></h2>
+        <div class="row">
+          <label class="check"><input type="checkbox" name="tableEnabled" value="1"<?= !empty($table['enabled']) ? ' checked' : '' ?>> Show a table on this frame</label>
+        </div>
         <div class="table-editor" data-table-editor>
+          <div class="row">
+            <label class="field"><span>Start from a template <em>replaces the rows below</em></span>
+              <select data-table-template>
+                <option value="">Choose a template&hellip;</option>
+                <option value="shoprate">Shop rate table: Item / Weight / Rate / Amount</option>
+                <option value="royalscroll">Royal scroll: shop rate table with banner &amp; tagline</option>
+                <option value="simple">Simple: Item / Rate</option>
+                <option value="gold">Gold rate board (24K / 22K)</option>
+                <option value="premiumdark">Premium dark: black &amp; gold LED board</option>
+                <option value="royalblue">Royal blue: navy &amp; gold</option>
+                <option value="classicwhite">Classic white: minimal black &amp; white</option>
+                <option value="silverboard">Silver rate board: steel &amp; white</option>
+              </select>
+            </label>
+          </div>
           <p class="hint">Click the small swatch beside a row or above a column to tint its background.</p>
           <div class="table-editor__grid" data-table-grid></div>
           <div class="table-editor__toolbar">
@@ -1923,44 +2692,75 @@ document.addEventListener('DOMContentLoaded', function () {
         <?php else: ?>
           <p class="hint">No tags yet &mdash; add one below, then use it here as {{name}} to auto-fill a value like today's rate everywhere it appears.</p>
         <?php endif; ?>
-        <input type="hidden" name="tableRows" data-table-rows-json value="<?= e(json_encode($companyTableGrid)) ?>">
+        <input type="hidden" name="tableRows" data-table-rows-json value="<?= e(json_encode($tableGrid)) ?>">
         <div class="row">
-          <label class="check"><input type="checkbox" name="tableHeaderRow" value="1"<?= !empty($companyTable['headerRow']) ? ' checked' : '' ?>> First row is a header</label>
-          <label class="check"><input type="checkbox" name="tableRounded" value="1"<?= !empty($companyTable['rounded']) ? ' checked' : '' ?>> Rounded corners</label>
+          <label class="check"><input type="checkbox" name="tableHeaderRow" value="1"<?= !empty($table['headerRow']) ? ' checked' : '' ?>> First row is a header</label>
+          <label class="check"><input type="checkbox" name="tableRounded" value="1"<?= !empty($table['rounded']) ? ' checked' : '' ?>> Rounded corners</label>
         </div>
         <div class="row">
-          <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $companyTable['hAlign'] ?? 'center'); ?></div>
-          <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $companyTable['vAlign'] ?? 'center'); ?></div>
+          <label class="field"><span>Banner title <em>optional, shown above the table</em></span><input type="text" name="tableTitle" maxlength="60" value="<?= e($table['title'] ?? '') ?>" placeholder="e.g. Shop Rate Table"></label>
+          <label class="field"><span>Footer tagline <em>optional, shown below the table</em></span><input type="text" name="tableFooter" maxlength="80" value="<?= e($table['footer'] ?? '') ?>" placeholder="e.g. Your Dream Jewellery Awaits..."></label>
         </div>
         <div class="row">
-          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($companyTable['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
-          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($companyTable['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
+          <?php xs_color_field('tableBannerColor', 'Banner colour', $table['bannerColor'] ?? '#4a0f12', '#4a0f12'); ?>
+          <?php xs_color_field('tableBannerTextColor', 'Banner text colour', $table['bannerTextColor'] ?? '#c9a04e', '#c9a04e'); ?>
+          <?php xs_color_field('tableFooterColor', 'Footer tagline colour', $table['footerColor'] ?? '#c9a04e', '#c9a04e'); ?>
+        </div>
+        <div class="row">
+          <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['hAlign'] ?? 'center'); ?></div>
+          <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['vAlign'] ?? 'center'); ?></div>
+        </div>
+        <div class="row">
+          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
+          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
         </div>
         <div class="row">
           <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($companyTable['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($companyTable['width'] ?? 0) > 0 ? $companyTable['width'] . '%' : 'Auto') ?></output></div>
+            <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($table['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($table['width'] ?? 0) > 0 ? $table['width'] . '%' : 'Auto') ?></output></div>
           </div>
           <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($companyTable['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($companyTable['height'] ?? 0) > 0 ? $companyTable['height'] . '%' : 'Auto') ?></output></div>
+            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($table['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($table['height'] ?? 0) > 0 ? $table['height'] . '%' : 'Auto') ?></output></div>
           </div>
         </div>
         <div class="row">
           <div class="field"><span>Data text size</span>
-            <div class="range-row"><input type="range" name="tableFontSize" min="10" max="200" step="1" value="<?= e($companyTable['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($companyTable['fontSize'] ?? 16) ?>px</output></div>
+            <div class="range-row"><input type="range" name="tableFontSize" min="10" max="200" step="1" value="<?= e($table['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($table['fontSize'] ?? 16) ?>px</output></div>
           </div>
           <div class="field"><span>Header text size</span>
-            <div class="range-row"><input type="range" name="tableHeaderFontSize" min="10" max="200" step="1" value="<?= e($companyTable['headerFontSize'] ?? $companyTable['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($companyTable['headerFontSize'] ?? $companyTable['fontSize'] ?? 16) ?>px</output></div>
+            <div class="range-row"><input type="range" name="tableHeaderFontSize" min="10" max="200" step="1" value="<?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>" data-range data-unit="px"><output><?= e($table['headerFontSize'] ?? $table['fontSize'] ?? 16) ?>px</output></div>
           </div>
           <div class="field"><span>Background opacity <em>0% is fully see-through</em></span>
-            <div class="range-row"><input type="range" name="tableBgOpacity" min="0" max="1" step="0.05" value="<?= e($companyTable['bgOpacity'] ?? 0.55) ?>" data-range><output><?= e(round(($companyTable['bgOpacity'] ?? 0.55) * 100)) ?>%</output></div>
+            <div class="range-row"><input type="range" name="tableBgOpacity" min="0" max="1" step="0.05" value="<?= e($table['bgOpacity'] ?? 0.55) ?>" data-range><output><?= e(round(($table['bgOpacity'] ?? 0.55) * 100)) ?>%</output></div>
           </div>
         </div>
         <div class="row">
-          <?php xs_color_field('tableTextColor', 'Text colour', $companyTable['textColor'] ?? '#ffffff', '#ffffff'); ?>
-          <?php xs_color_field('tableHeaderColor', 'Header colour', $companyTable['headerColor'] ?? '#ff2d8f', '#ff2d8f'); ?>
-          <?php xs_color_field('tableBorderColor', 'Border colour', $companyTable['borderColor'] ?? '#ffffff', '#ffffff'); ?>
-          <label class="field"><span>Border thickness <em>px</em></span><input type="number" name="tableBorderWidth" min="0" max="8" value="<?= e($companyTable['borderWidth'] ?? 1) ?>"></label>
+          <?php xs_color_field('tableBgColor', 'Background colour', $table['bgColor'] ?? '#0a0908', '#0a0908'); ?>
+          <?php xs_color_field('tableTextColor', 'Text colour', $table['textColor'] ?? '#ffffff', '#ffffff'); ?>
+          <?php xs_color_field('tableHeaderColor', 'Header colour', $table['headerColor'] ?? '#ff2d8f', '#ff2d8f'); ?>
+          <?php xs_color_field('tableBorderColor', 'Border colour', $table['borderColor'] ?? '#ffffff', '#ffffff'); ?>
+          <label class="field"><span>Border thickness <em>px</em></span><input type="number" name="tableBorderWidth" min="0" max="8" value="<?= e($table['borderWidth'] ?? 1) ?>"></label>
         </div>
+        <div class="row">
+          <div class="field"><span>Header colour transparency <em>0% is fully see-through; fills the header row with Header colour, text in Border colour</em></span>
+            <div class="range-row"><input type="range" name="tableHeaderBgOpacity" min="0" max="1" step="0.05" value="<?= e($table['headerBgOpacity'] ?? 0) ?>" data-range><output><?= e(round(($table['headerBgOpacity'] ?? 0) * 100)) ?>%</output></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Labels <small>free-floating text badges, independent of the table &mdash; drag each one anywhere, up to 8</small></h2>
+        <input type="hidden" name="tableLabelsJson" data-labels-json value="<?= e(json_encode($table['labels'] ?? [])) ?>">
+        <div data-label-list></div>
+        <div class="row"><div><button type="button" class="btn btn--sm" data-label-add>+ Add label</button></div></div>
+        <?php if ($tags): ?>
+          <p class="hint">Click to insert into the focused field (a table cell or a label's text):
+            <?php foreach ($tags as $tname => $tval): ?>
+              <button type="button" class="tag-chip" data-insert-tag="<?= e($tname) ?>" title="<?= e($tval) ?>">{{<?= e($tname) ?>}}</button>
+            <?php endforeach; ?>
+          </p>
+        <?php else: ?>
+          <p class="hint">A label's text supports {{tag}} the same way a table cell does &mdash; e.g. "Updated {{RATEDATE}} {{RATETIME}}".</p>
+        <?php endif; ?>
       </section>
     </form>
 
@@ -1973,20 +2773,8 @@ document.addEventListener('DOMContentLoaded', function () {
             <label><input type="radio" name="pv" value="phone" data-pv><span>Phone</span></label>
           </div>
         </div>
-        <?php if ($frames): ?>
-        <div class="preview__bar">
-          <label class="field" style="flex:1"><span>Show over frame</span>
-            <select data-preview-frame-select>
-              <option value="">No frame &mdash; plain background</option>
-              <?php foreach ($frames as $i => $fr): ?>
-                <option value="<?= e($fr['id']) ?>"<?= $i === 0 ? ' selected' : '' ?>><?= e($fr['title'] ?? $fr['id']) ?></option>
-              <?php endforeach; ?>
-            </select>
-          </label>
-        </div>
-        <?php endif; ?>
         <div class="preview__frame" data-preview data-device-w="<?= $deviceW ? (int) $deviceW : '' ?>" data-device-h="<?= $deviceH ? (int) $deviceH : '' ?>">
-          <iframe data-preview-iframe data-preview-src-base="NexShow.php?preview=1&amp;tableonly=1" src="NexShow.php?preview=1&amp;tableonly=1<?= $frames ? '&amp;previewFrame=' . rawurlencode($frames[0]['id']) : '' ?>&amp;t=<?= time() ?>" title="Table preview" loading="lazy" tabindex="-1"></iframe>
+          <iframe src="NexShow.php?preview=1&amp;frame=<?= $tableFrameIdx ?>&amp;t=<?= time() ?>" title="Table preview" loading="lazy" tabindex="-1"></iframe>
           <?php foreach (['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'] as $dir): ?>
             <div class="preview__table-point" data-table-point data-dir="<?= $dir ?>" title="Drag to resize the table" hidden></div>
           <?php endforeach; ?>
@@ -2022,9 +2810,14 @@ document.addEventListener('DOMContentLoaded', function () {
       <button class="btn btn--sm" type="button" data-close>Done</button>
     </div>
   </dialog>
+  <?php endif; ?>
 
   <section class="panel">
-    <h2>Tags <small>named values usable as {{name}} in a frame's table cells &mdash; update one here, it updates everywhere</small></h2>
+    <div class="panel__head-row">
+      <h2>Tags <small>named values usable as {{name}} in a frame's table cells &mdash; update one here, it updates everywhere</small></h2>
+      <button type="button" class="btn btn--sm" data-tags-toggle>Show tags<?= $tags ? ' (' . count($tags) . ')' : '' ?></button>
+    </div>
+    <div data-tags-body hidden>
     <?php if (!$tags): ?>
       <p class="hint">No tags yet. Add the first one in the row below, then use it in a frame's table as {{name}} to auto-fill a value like today's rate everywhere it appears.</p>
     <?php endif; ?>
@@ -2069,16 +2862,53 @@ document.addEventListener('DOMContentLoaded', function () {
       <input type="hidden" name="action" value="save_tag">
       <input type="hidden" name="back" value="view=table">
     </form>
+    </div>
   </section>
 <?php endif; ?>
 </main>
 
 <script>
 (function () {
-  // Confirm before destructive actions.
+  // Confirm before destructive actions — a themed dialog instead of the browser's own confirm(),
+  // which always shows the page's URL/origin in its text ("The page at '...' says") with no way
+  // for a page to suppress or restyle that (deliberately, so a page can never fake a trustworthy-
+  // looking prompt). One shared dialog, reused for every data-confirm form on the page.
+  var confirmDlg = document.getElementById('confirmDialog');
   document.querySelectorAll('form[data-confirm]').forEach(function (f) {
-    f.addEventListener('submit', function (e) { if (!confirm(f.dataset.confirm)) e.preventDefault(); });
+    f.addEventListener('submit', function (e) {
+      if (f.dataset.confirmed) { delete f.dataset.confirmed; return; } // already confirmed — let it through
+      e.preventDefault();
+      if (!confirmDlg) { if (confirm(f.dataset.confirm)) { f.dataset.confirmed = '1'; f.requestSubmit(); } return; }
+      confirmDlg.querySelector('[data-confirm-message]').textContent = f.dataset.confirm;
+      var okBtn = confirmDlg.querySelector('[data-confirm-ok]');
+      var cancelBtn = confirmDlg.querySelector('[data-confirm-cancel]');
+      var onOk = function () { confirmDlg.close('ok'); };
+      var onCancel = function () { confirmDlg.close('cancel'); };
+      var onClose = function () {
+        okBtn.removeEventListener('click', onOk);
+        cancelBtn.removeEventListener('click', onCancel);
+        confirmDlg.removeEventListener('close', onClose);
+        if (confirmDlg.returnValue === 'ok') { f.dataset.confirmed = '1'; f.requestSubmit(); }
+      };
+      okBtn.addEventListener('click', onOk);
+      cancelBtn.addEventListener('click', onCancel);
+      confirmDlg.addEventListener('close', onClose);
+      confirmDlg.showModal();
+    });
   });
+
+  // Tags panel on Table Settings starts collapsed — click to reveal (saving a tag reloads the
+  // page, so it resets to collapsed again rather than trying to remember it was open).
+  var tagsToggle = document.querySelector('[data-tags-toggle]');
+  var tagsBody = document.querySelector('[data-tags-body]');
+  if (tagsToggle && tagsBody) {
+    tagsToggle.addEventListener('click', function () {
+      var showing = !tagsBody.hidden;
+      tagsBody.hidden = showing;
+      tagsToggle.textContent = showing ? tagsToggle.dataset.showLabel : 'Hide tags';
+    });
+    tagsToggle.dataset.showLabel = tagsToggle.textContent;
+  }
 
   // Light/dark mode: persisted, applied before paint by the inline script in <head>.
   var themeBtn = document.querySelector('[data-theme-toggle]');
@@ -2097,6 +2927,16 @@ document.addEventListener('DOMContentLoaded', function () {
       renderTheme();
     });
     renderTheme();
+  }
+
+  // Table Settings' frame picker: present even when no frame is selected yet (so there's no
+  // #frame-form on the page at all), so this has to live above the early-return below.
+  var tableFrameSelect = document.querySelector('[data-table-frame-select]');
+  if (tableFrameSelect) {
+    tableFrameSelect.addEventListener('change', function () {
+      var id = tableFrameSelect.value;
+      location.href = 'admin.php?view=table' + (id ? '&frame=' + encodeURIComponent(id) : '');
+    });
   }
 
   var form = document.getElementById('frame-form');
@@ -2120,6 +2960,7 @@ document.addEventListener('DOMContentLoaded', function () {
   form.addEventListener('input', markDirty);
   form.addEventListener('change', markDirty);
   form.addEventListener('submit', function () { dirty = false; });
+
   // The browser's own beforeunload prompt (for closing the tab, typing a new URL, or using
   // back/forward) can't be restyled — browsers deliberately keep it generic so a page can never
   // fake a trustworthy-looking one. It stays as the fallback for those cases. But a normal in-app
@@ -2352,6 +3193,19 @@ document.addEventListener('DOMContentLoaded', function () {
     });
   }
 
+  // The Phone portrait image starts tucked behind the "Portrait mode" button (most frames just
+  // use the one photo/video for every screen) — click reveals the field in its place, same as the
+  // Tags panel's own show/hide toggle on Table Settings. Hidden only when the frame has no mobile
+  // image saved yet.
+  var mobileImageToggle = document.querySelector('[data-mobile-image-toggle]');
+  var mobileImageField = document.querySelector('[data-mobile-image-field]');
+  if (mobileImageToggle && mobileImageField) {
+    mobileImageToggle.addEventListener('click', function () {
+      mobileImageField.hidden = false;
+      mobileImageToggle.hidden = true;
+    });
+  }
+
   // Image/video fields: upload preview, path typing, remove.
   var VIDEO_EXT = /\.(mp4|webm|mov|m4v)$/i;
   document.querySelectorAll('[data-imgfield]').forEach(function (box) {
@@ -2403,10 +3257,14 @@ document.addEventListener('DOMContentLoaded', function () {
         dlg.showModal();
       });
     });
+    // See the Rate dialog's identical comment: only a press-and-release both landing on the
+    // backdrop counts as a backdrop click, so dragging a selection out of the library doesn't close it.
+    var libraryBackdropDown = false;
+    dlg.addEventListener('mousedown', function (e) { libraryBackdropDown = e.target === dlg; });
     dlg.addEventListener('click', function (e) {
       var pick = e.target.closest('[data-pick]');
       if (pick && target) { target.setValue(pick.dataset.pick); dlg.close(); }
-      else if (e.target === dlg || e.target.closest('[data-close]')) dlg.close();
+      else if ((e.target === dlg && libraryBackdropDown) || e.target.closest('[data-close]')) dlg.close();
     });
   }
 
@@ -2544,9 +3402,239 @@ document.addEventListener('DOMContentLoaded', function () {
       sync(); renderGrid();
     });
 
+    var TABLE_TEMPLATES = {
+      shoprate: {
+        headerRow: true,
+        rounded: true,
+        rows: [
+          ['ITEM', 'WEIGHT/GRAM', 'RATE (₹)', 'AMOUNT (₹)'],
+          ['', '', '', ''], ['', '', '', ''], ['', '', '', ''],
+          ['', '', '', ''], ['', '', '', ''], ['', '', '', ''],
+        ],
+        // Cream card + maroon header band (Header colour) + gold border (also the header text).
+        colors: { tableBgColor: '#f7eeda', tableTextColor: '#4a1f1f', tableHeaderColor: '#4a0f12', tableBorderColor: '#c9a04e', tableBannerColor: '#4a0f12', tableBannerTextColor: '#c9a04e', tableFooterColor: '#c9a04e' },
+        borderWidth: 2,
+        bgOpacity: 0.97,
+        headerBgOpacity: 1,
+      },
+      royalscroll: {
+        headerRow: true,
+        rounded: true,
+        rows: [
+          ['METAL', 'SALE', 'URD', 'EXCHANGE'],
+          ['', '', '', ''], ['', '', '', ''], ['', '', '', ''],
+          ['', '', '', ''], ['', '', '', ''], ['', '', '', ''],
+        ],
+        // Same cream/maroon/gold look as Shop rate table, plus the ornate title banner and
+        // italic footer tagline on top.
+        colors: { tableBgColor: '#f7eeda', tableTextColor: '#4a1f1f', tableHeaderColor: '#4a0f12', tableBorderColor: '#c9a04e', tableBannerColor: '#4a0f12', tableBannerTextColor: '#c9a04e', tableFooterColor: '#c9a04e' },
+        borderWidth: 2,
+        bgOpacity: 0.97,
+        headerBgOpacity: 1,
+        title: 'Shop Rate Table',
+        footer: 'Your Dream Jewellery Awaits...',
+      },
+      simple: {
+        headerRow: true,
+        rows: [['Item', 'Rate'], ['', ''], ['', '']],
+      },
+      gold: {
+        headerRow: true,
+        rows: [['Metal', 'Rate (₹)'], ['24K Gold', ''], ['22K Gold', '']],
+      },
+      premiumdark: {
+        headerRow: true,
+        rounded: true,
+        rows: [
+          ['PURITY', 'RATE (₹)'],
+          ['24K', ''], ['22K', ''], ['18K', ''], ['14K', ''],
+        ],
+        // Matte black card + gold text/border, like an LED jewellery rate board.
+        colors: { tableBgColor: '#0d0d0d', tableTextColor: '#f3d98b', tableHeaderColor: '#1a1a1a', tableBorderColor: '#d4af37' },
+        borderWidth: 2,
+        bgOpacity: 0.95,
+        headerBgOpacity: 1,
+      },
+      royalblue: {
+        headerRow: true,
+        rounded: true,
+        rows: [
+          ['ITEM', 'RATE (₹)'],
+          ['Gold 22K', ''], ['Gold 18K', ''], ['Silver', ''],
+        ],
+        // Navy card + gold header/border + white text.
+        colors: { tableBgColor: '#0b1f4d', tableTextColor: '#ffffff', tableHeaderColor: '#081738', tableBorderColor: '#d4af37' },
+        borderWidth: 2,
+        bgOpacity: 0.95,
+        headerBgOpacity: 1,
+      },
+      classicwhite: {
+        headerRow: true,
+        rounded: false,
+        rows: [
+          ['Item', 'Rate (₹)'],
+          ['', ''], ['', ''],
+        ],
+        // Plain white card + black text/border — minimal, high-contrast.
+        colors: { tableBgColor: '#ffffff', tableTextColor: '#111111', tableHeaderColor: '#ededed', tableBorderColor: '#111111' },
+        borderWidth: 1,
+        bgOpacity: 1,
+        headerBgOpacity: 1,
+      },
+      silverboard: {
+        headerRow: true,
+        rounded: true,
+        rows: [
+          ['ITEM', 'RATE (₹)'],
+          ['Silver (per gram)', ''], ['Silver (per kg)', ''],
+        ],
+        // Cool steel-gray card + dark header + silver border.
+        colors: { tableBgColor: '#e9edf1', tableTextColor: '#1f2a33', tableHeaderColor: '#39434c', tableBorderColor: '#9aa6b0' },
+        borderWidth: 2,
+        bgOpacity: 0.97,
+        headerBgOpacity: 1,
+      },
+    };
+    // Sets one of the custom color-picker fields (swatch + hex text + hidden value) to a hex color.
+    function setColorField(name, hex) {
+      var hidden = form.querySelector('[data-color-value][name="' + name + '"]');
+      if (!hidden) return;
+      hidden.value = hex;
+      var wrap = hidden.previousElementSibling; // the .color-field sibling right before the hidden input
+      if (!wrap) return;
+      var swatch = wrap.querySelector('[data-color-swatch]');
+      var hexInput = wrap.querySelector('[data-color-hex]');
+      if (swatch) swatch.style.background = hex;
+      if (hexInput) hexInput.value = hex;
+    }
+    var templateSelect = tableEditor.querySelector('[data-table-template]');
+    if (templateSelect) {
+      templateSelect.addEventListener('change', function () {
+        var key = templateSelect.value;
+        templateSelect.value = ''; // so picking the same one again still fires change next time
+        if (!key || !TABLE_TEMPLATES[key]) return;
+        var hasContent = rows.some(function (r) { return r.some(function (cell) { return cell !== ''; }); });
+        if (hasContent && !confirm('Replace the current table rows (and its colors) with this template?')) return;
+        var tpl = TABLE_TEMPLATES[key];
+        rows = tpl.rows.map(function (r) { return r.slice(); });
+        rowColors = [];
+        colColors = [];
+        if (headerCheckbox) headerCheckbox.checked = tpl.headerRow;
+        var roundedCb = form.querySelector('[name="tableRounded"]');
+        if (roundedCb) roundedCb.checked = !!tpl.rounded;
+        if (tpl.colors) {
+          Object.keys(tpl.colors).forEach(function (name) { setColorField(name, tpl.colors[name]); });
+        }
+        if (tpl.borderWidth !== undefined) {
+          var bw = form.querySelector('[name="tableBorderWidth"]');
+          if (bw) bw.value = tpl.borderWidth;
+        }
+        if (tpl.bgOpacity !== undefined) {
+          var op = form.querySelector('[name="tableBgOpacity"]');
+          if (op) { op.value = tpl.bgOpacity; op.dispatchEvent(new Event('input', { bubbles: true })); }
+        }
+        var headerOp = form.querySelector('[name="tableHeaderBgOpacity"]');
+        if (headerOp) { headerOp.value = tpl.headerBgOpacity || 0; headerOp.dispatchEvent(new Event('input', { bubbles: true })); }
+        var titleInput = form.querySelector('[name="tableTitle"]');
+        if (titleInput) titleInput.value = tpl.title || '';
+        var footerInput = form.querySelector('[name="tableFooter"]');
+        if (footerInput) footerInput.value = tpl.footer || '';
+        sync(); renderGrid();
+        markDirty();
+      });
+    }
+
+    // Labels editor: a variable-length list of free-floating text badges, each with its own
+    // position/size/colour, serialized as JSON into one hidden input (same approach as the table's
+    // own rowsInput) — the preview's drag code (bindLabelMove, further down) reads/writes this same
+    // array directly so a drag in the preview and an edit here both stay in sync.
+    var labelListEl = document.querySelector('[data-label-list]');
+    var labelsInput = document.querySelector('[data-labels-json]');
+    var labels = [];
+    if (labelListEl && labelsInput) {
+      try { labels = JSON.parse(labelsInput.value) || []; } catch (e) { labels = []; }
+      if (!Array.isArray(labels)) labels = [];
+
+      var syncLabels = function () { labelsInput.value = JSON.stringify(labels); };
+
+      var renderLabelList = function () {
+        labelListEl.innerHTML = '';
+        labels.forEach(function (lbl, idx) {
+          var row = document.createElement('div');
+          row.className = 'label-row';
+
+          var textWrap = document.createElement('label');
+          textWrap.className = 'label-row__text';
+          var textInput = document.createElement('input');
+          textInput.type = 'text';
+          textInput.maxLength = 200;
+          textInput.placeholder = 'Label text, supports {{tag}}';
+          textInput.value = lbl.text || '';
+          textInput.addEventListener('focus', function () { lastFocusedCell = textInput; });
+          textInput.addEventListener('input', function () { labels[idx].text = textInput.value; syncLabels(); });
+          textWrap.appendChild(textInput);
+          row.appendChild(textWrap);
+
+          function makeSelect(options, value, onChange) {
+            var sel = document.createElement('select');
+            options.forEach(function (opt) {
+              var o = document.createElement('option');
+              o.value = opt[0]; o.textContent = opt[1];
+              if (opt[0] === value) o.selected = true;
+              sel.appendChild(o);
+            });
+            sel.addEventListener('change', onChange);
+            return sel;
+          }
+          row.appendChild(makeSelect([['left', 'Left'], ['center', 'Center'], ['right', 'Right']], lbl.hAlign || 'center', function () { labels[idx].hAlign = this.value; syncLabels(); }));
+          row.appendChild(makeSelect([['top', 'Top'], ['center', 'Middle'], ['bottom', 'Bottom']], lbl.vAlign || 'center', function () { labels[idx].vAlign = this.value; syncLabels(); }));
+
+          var fontInput = document.createElement('input');
+          fontInput.type = 'number'; fontInput.min = 10; fontInput.max = 200;
+          fontInput.value = lbl.fontSize || 20;
+          fontInput.title = 'Text size (px)';
+          fontInput.addEventListener('input', function () { labels[idx].fontSize = parseInt(fontInput.value, 10) || 20; syncLabels(); });
+          row.appendChild(fontInput);
+
+          var colorInput = document.createElement('input');
+          colorInput.type = 'color';
+          colorInput.value = lbl.color || '#ffffff';
+          colorInput.title = 'Text colour';
+          colorInput.addEventListener('input', function () { labels[idx].color = colorInput.value; syncLabels(); });
+          row.appendChild(colorInput);
+
+          var removeBtn = document.createElement('button');
+          removeBtn.type = 'button';
+          removeBtn.className = 'label-row__remove';
+          removeBtn.innerHTML = '&times;';
+          removeBtn.title = 'Remove label';
+          removeBtn.addEventListener('click', function () {
+            labels.splice(idx, 1);
+            syncLabels();
+            renderLabelList();
+          });
+          row.appendChild(removeBtn);
+
+          labelListEl.appendChild(row);
+        });
+      };
+
+      var labelAddBtn = document.querySelector('[data-label-add]');
+      if (labelAddBtn) {
+        labelAddBtn.addEventListener('click', function () {
+          if (labels.length >= 8) { alert('Up to 8 labels per frame.'); return; }
+          labels.push({ text: '', hAlign: 'center', vAlign: 'center', offsetX: '0px', offsetY: '0px', fontSize: 20, color: '#ffffff' });
+          syncLabels();
+          renderLabelList();
+        });
+      }
+
+      renderLabelList();
+    }
+
     document.querySelectorAll('[data-insert-tag]').forEach(function (chip) {
       chip.addEventListener('click', function () {
-        if (!lastFocusedCell) { alert('Click into a table cell first, then click a tag to insert it there.'); return; }
+        if (!lastFocusedCell) { alert('Click into a table cell or the label text field first, then click a tag to insert it there.'); return; }
         var tag = '{{' + chip.dataset.insertTag + '}}';
         var el = lastFocusedCell, start = el.selectionStart || el.value.length, end = el.selectionEnd || el.value.length;
         el.value = el.value.slice(0, start) + tag + el.value.slice(end);
@@ -2569,17 +3657,6 @@ document.addEventListener('DOMContentLoaded', function () {
     // device menu (see NexShow.php) — falls back to a generic 1920x1080 guess until that's known.
     var deviceW = parseInt(pv.dataset.deviceW, 10) || 0;
     var deviceH = parseInt(pv.dataset.deviceH, 10) || 0;
-    // Table Settings only: picking a frame from the dropdown swaps the preview's backdrop to that
-    // frame's own image/text, with the table forced on regardless of that frame's own toggle —
-    // just a visual backdrop, never touched by this page's own save.
-    var frameSelect = document.querySelector('[data-preview-frame-select]');
-    if (frameSelect) {
-      frameSelect.addEventListener('change', function () {
-        var base = frame.dataset.previewSrcBase;
-        var id = frameSelect.value;
-        frame.src = base + (id ? '&previewFrame=' + encodeURIComponent(id) : '') + '&t=' + Date.now();
-      });
-    }
     var points = pv.querySelectorAll('[data-table-point]');
     var offsetXInput = form.querySelector('[data-table-offset-x]');
     var offsetYInput = form.querySelector('[data-table-offset-y]');
@@ -2588,18 +3665,30 @@ document.addEventListener('DOMContentLoaded', function () {
     var curScale = 1, curLeft = 0;
     // Dragging the title/description block itself nudges offsetX/offsetY — the same desktop-only
     // nudge the Text card's own inputs write to. Bound fresh on every load since the iframe's
-    // document (and its elements) is recreated each time.
+    // document (and its elements) is recreated each time. The actual hit area is the full
+    // .slide__layout box (the whole slide), not just .slide__content itself — a short title with
+    // no eyebrow/description/button is a tiny, easy-to-miss target otherwise; clicking anywhere on
+    // the slide (outside the button, and outside wherever the table currently has priority) picks
+    // the text up instead.
     function bindTextMove(doc) {
-      var content = doc.querySelector('.slide__content');
-      if (!content || !textOffsetXInput || !textOffsetYInput) return;
+      // Scoped to .slide.is-active — see the same note in tableEls(): every frame in this company
+      // renders into the preview page at once, so an unscoped lookup could bind to a different
+      // (hidden) frame's text block instead of the one actually being previewed/edited here.
+      var active = doc.querySelector('.slide.is-active');
+      var content = active && active.querySelector('.slide__content');
+      var layout = active && active.querySelector('.slide__layout');
+      if (!content || !layout || !textOffsetXInput || !textOffsetYInput) return;
       content.style.cursor = 'grab';
-      content.addEventListener('pointerdown', function (e) {
+      layout.style.cursor = 'grab';
+      layout.addEventListener('pointerdown', function (e) {
+        if (e.target.closest('a, button')) return;
         e.preventDefault();
         var startX = e.clientX, startY = e.clientY;
         var startOffsetX = parseFloat(textOffsetXInput.value) || 0;
         var startOffsetY = parseFloat(textOffsetYInput.value) || 0;
-        content.setPointerCapture(e.pointerId);
+        layout.setPointerCapture(e.pointerId);
         content.style.cursor = 'grabbing';
+        layout.style.cursor = 'grabbing';
         function onMove(ev) {
           var nx = Math.round(startOffsetX + (ev.clientX - startX));
           var ny = Math.round(startOffsetY + (ev.clientY - startY));
@@ -2610,7 +3699,8 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         function onUp(ev) {
           content.style.cursor = 'grab';
-          content.releasePointerCapture(ev.pointerId);
+          layout.style.cursor = 'grab';
+          layout.releasePointerCapture(ev.pointerId);
           doc.removeEventListener('pointermove', onMove);
           doc.removeEventListener('pointerup', onUp);
           textOffsetXInput.dispatchEvent(new Event('input', { bubbles: true }));
@@ -2625,8 +3715,20 @@ document.addEventListener('DOMContentLoaded', function () {
     // iframe's document (and its elements) is recreated each time. Binds to .slide__table-pos (the
     // div that carries the position/size), not .slide__table-wrap or the <table> nested inside it.
     function bindTableMove(doc) {
-      var wrap = doc.querySelector('.slide__table-pos');
-      if (!wrap || !offsetXInput || !offsetYInput) return;
+      // Scoped to .slide.is-active — same reasoning as tableEls()/bindTextMove above.
+      var active = doc.querySelector('.slide.is-active');
+      var wrap = active && active.querySelector('.slide__table-pos');
+      if (!wrap) return;
+      if (!offsetXInput || !offsetYInput) {
+        // This page has nothing to drag the table's position into (that now lives on the Table
+        // Settings page only) — but NexShow.php's own CSS still gives .slide__table-pos
+        // pointer-events:auto so IT can be dragged there, which on THIS page just means it sits
+        // on top and silently absorbs clicks meant for whatever's underneath (most commonly the
+        // title, when a frame's table happens to overlap it) with nothing listening to use them.
+        // Making it click-through here restores that, without touching the real NexShow.php CSS.
+        wrap.style.pointerEvents = 'none';
+        return;
+      }
       wrap.style.cursor = 'grab';
       wrap.addEventListener('pointerdown', function (e) {
         e.preventDefault();
@@ -2656,6 +3758,55 @@ document.addEventListener('DOMContentLoaded', function () {
         doc.addEventListener('pointerup', onUp);
       });
     }
+    // Dragging a label nudges that label's own offsetX/offsetY directly inside the shared `labels`
+    // array (declared above, in the Labels editor block) and re-serializes it via syncLabels() —
+    // same array the editor's rows read/write, so a drag here and an edit there always agree.
+    // Each rendered .slide__label-pos carries data-label-index to say which array entry it is.
+    // Only meaningful on the Table Settings page (where the Labels panel/array exist); elsewhere
+    // this just makes every label click-through so it doesn't swallow clicks meant for whatever's
+    // underneath, same reasoning as bindTableMove.
+    function bindLabelMove(doc) {
+      var active = doc.querySelector('.slide.is-active');
+      if (!active) return;
+      var wraps = active.querySelectorAll('.slide__label-pos');
+      wraps.forEach(function (wrap) {
+        if (!labels.length) {
+          wrap.style.pointerEvents = 'none';
+          return;
+        }
+        var idx = parseInt(wrap.dataset.labelIndex, 10);
+        if (isNaN(idx) || !labels[idx]) {
+          wrap.style.pointerEvents = 'none';
+          return;
+        }
+        wrap.style.cursor = 'grab';
+        wrap.addEventListener('pointerdown', function (e) {
+          e.preventDefault();
+          var startX = e.clientX, startY = e.clientY;
+          var startOffsetX = parseFloat(labels[idx].offsetX) || 0;
+          var startOffsetY = parseFloat(labels[idx].offsetY) || 0;
+          wrap.setPointerCapture(e.pointerId);
+          wrap.style.cursor = 'grabbing';
+          function onMove(ev) {
+            var nx = Math.round(startOffsetX + (ev.clientX - startX));
+            var ny = Math.round(startOffsetY + (ev.clientY - startY));
+            wrap.style.setProperty('--label-offset-x', nx + 'px');
+            wrap.style.setProperty('--label-offset-y', ny + 'px');
+            labels[idx].offsetX = nx + 'px';
+            labels[idx].offsetY = ny + 'px';
+            syncLabels();
+          }
+          function onUp(ev) {
+            wrap.style.cursor = 'grab';
+            wrap.releasePointerCapture(ev.pointerId);
+            doc.removeEventListener('pointermove', onMove);
+            doc.removeEventListener('pointerup', onUp);
+          }
+          doc.addEventListener('pointermove', onMove);
+          doc.addEventListener('pointerup', onUp);
+        });
+      });
+    }
     // The preview page is its own fullscreen, non-scrolling document (overflow: hidden), so a
     // wheel scroll over it would otherwise just do nothing instead of scrolling this admin page.
     // Same-origin iframe, so we can reach in and forward the scroll to the parent ourselves.
@@ -2674,6 +3825,7 @@ document.addEventListener('DOMContentLoaded', function () {
         // touch. A touch user can still scroll this page normally from outside the preview box.
         bindTableMove(doc);
         bindTextMove(doc);
+        bindLabelMove(doc);
       } catch (e) {}
       placePoints();
     });
@@ -2700,9 +3852,15 @@ document.addEventListener('DOMContentLoaded', function () {
     function tableEls() {
       try {
         var doc = frame.contentDocument;
-        var wrap = doc.querySelector('.slide__table-pos');
-        var table = doc.querySelector('.slide__table');
-        var layout = doc.querySelector('.slide__table-layout');
+        // Scoped to .slide.is-active: the preview renders every frame into the page at once (all
+        // but the active one just sit hidden via CSS for the slide transition), so an unscoped
+        // doc.querySelector('.slide__table-pos') grabs whichever frame's table happens to come
+        // first in the document — not necessarily the one actually being edited/previewed here.
+        var active = doc.querySelector('.slide.is-active');
+        if (!active) return null;
+        var wrap = active.querySelector('.slide__table-pos');
+        var table = active.querySelector('.slide__table');
+        var layout = active.querySelector('.slide__table-layout');
         return wrap && table && layout ? { doc: doc, wrap: wrap, table: table, layout: layout } : null;
       } catch (e) { return null; }
     }
@@ -2837,6 +3995,85 @@ document.addEventListener('DOMContentLoaded', function () {
     });
     window.addEventListener('resize', fit);
     fit();
+
+    // Share: renders the preview iframe's own document to a canvas (it's same-origin, so this
+    // reaches straight into it) at the exact device size fit() just set on the iframe — not the
+    // scaled-down size shown in the panel — then hands it to the OS share sheet via the Web Share
+    // API, rather than downloading it. Sharing is a single OS-level Intent the browser engine
+    // fires itself on a user gesture, so unlike a file download it needs no cooperation from an
+    // Android WebView wrapper app at all. Loaded from a CDN on first use, not on every admin page
+    // load. Note: this is a DOM snapshot, not real pixels — a <video> background frame renders
+    // blank/black, same limitation any DOM-to-canvas library has.
+    var shareBtn = document.querySelector('[data-pv-share]');
+    if (shareBtn) {
+      var html2canvasPromise = null;
+      function loadHtml2Canvas() {
+        if (!html2canvasPromise) {
+          html2canvasPromise = new Promise(function (resolve, reject) {
+            if (window.html2canvas) { resolve(window.html2canvas); return; }
+            var s = document.createElement('script');
+            s.src = 'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js';
+            s.onload = function () { resolve(window.html2canvas); };
+            s.onerror = function () { reject(new Error('Could not load the share library — check your connection.')); };
+            document.head.appendChild(s);
+          });
+        }
+        return html2canvasPromise;
+      }
+      shareBtn.addEventListener('click', function () {
+        var doc = frame.contentDocument;
+        if (!doc || !doc.body) { alert('Preview is not ready yet — try again in a moment.'); return; }
+        var w = mode === 'phone' ? 390 : (deviceW || 1920);
+        var h = mode === 'phone' ? 844 : (deviceH || 1080);
+        // Renders at a higher pixel density than the preview's own CSS size, for a sharper shared
+        // image — the phone preset (390px) in particular is a deliberate manual-check width, far
+        // below any real phone's actual pixel density. Targets ~1170px wide for phone (matching a
+        // real device at 3x) or ~2560px for TV, but never upscales past 3x or below 1x — a TV
+        // already at or above that target (e.g. an actual 4K screen) renders at its own native
+        // resolution rather than wastefully blowing the canvas up even further.
+        var shareScale = Math.max(1, Math.min(3, (mode === 'phone' ? 1170 : 2560) / w));
+        var label = shareBtn.textContent;
+        shareBtn.disabled = true;
+        shareBtn.textContent = 'Preparing…';
+        loadHtml2Canvas().then(function (html2canvas) {
+          return html2canvas(doc.documentElement, {
+            width: w, height: h, windowWidth: w, windowHeight: h,
+            scale: shareScale, backgroundColor: '#000', useCORS: true,
+          });
+        }).then(function (canvas) {
+          var shotName = 'frame-preview-' + mode + '.png';
+          // Plain android.webkit.WebView doesn't implement navigator.share() at all (that's a
+          // full-Chrome feature, not something WebView gets for free just by being Chromium-based)
+          // — so if the Android app's WebView has registered window.AndroidShare, hand it the
+          // image data directly and let native code fire the real Android share Intent. Everywhere
+          // else (an actual mobile/desktop browser), fall back to the Web Share API; if neither is
+          // available, say so rather than failing silently.
+          if (window.AndroidShare && typeof window.AndroidShare.sharePng === 'function') {
+            window.AndroidShare.sharePng(canvas.toDataURL('image/png'), shotName);
+            return;
+          }
+          return new Promise(function (resolve, reject) {
+            canvas.toBlob(function (blob) {
+              if (blob) resolve(blob); else reject(new Error('Could not capture the preview.'));
+            }, 'image/png');
+          }).then(function (blob) {
+            var file = new File([blob], shotName, { type: 'image/png' });
+            if (navigator.canShare && navigator.canShare({ files: [file] })) {
+              return navigator.share({ files: [file], title: 'Frame preview' }).catch(function (err) {
+                if (err && err.name === 'AbortError') return; // user closed the share sheet
+                throw err;
+              });
+            }
+            throw new Error('Sharing isn\'t supported in this browser.');
+          });
+        }).catch(function (err) {
+          alert(err && err.message ? err.message : 'Could not share the preview.');
+        }).then(function () {
+          shareBtn.disabled = false;
+          shareBtn.textContent = label;
+        });
+      });
+    }
   }
 })();
 </script>

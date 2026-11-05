@@ -28,6 +28,13 @@ define('XS_DB_PASS', 'your_db_password');
 // itself is unaffected — it only ever checks password_hash), so back this up like the database.
 define('XS_PASSWORD_KEY', 'REPLACE_WITH_64_HEX_CHARS_FROM_bin2hex_random_bytes_32');
 
+// Razorpay API credentials — Dashboard > Settings > API Keys. Key ID is also sent to the browser
+// as-is to open Razorpay's Checkout widget (expected, it's the public half); Key Secret must
+// never reach the browser. Use rzp_test_... keys here while developing, rzp_live_... once ready
+// to accept real payments.
+define('XS_RAZORPAY_KEY_ID', 'REPLACE_WITH_YOUR_RAZORPAY_KEY_ID');
+define('XS_RAZORPAY_KEY_SECRET', 'REPLACE_WITH_YOUR_RAZORPAY_KEY_SECRET');
+
 // PHP defaults to UTC if nothing sets this, but MySQL's NOW() reflects the server's own system
 // clock. Every expires_at / reset_token_expires comparison mixes a PHP-built date string with a
 // MySQL NOW() — if the two disagree about what time it is, those comparisons are wrong by the
@@ -351,6 +358,7 @@ function xs_frame_column_map()
         'titleSize' => 'title_size',
         'titleWeight' => 'title_weight',
         'kenBurns' => 'ken_burns',
+        'muteVideo' => 'mute_video',
         'transition' => 'transition',
         'duration' => 'duration_ms',
     ];
@@ -363,7 +371,7 @@ function xs_db_row_to_frame(array $row)
     foreach (xs_frame_column_map() as $key => $col) {
         if (!array_key_exists($col, $row) || $row[$col] === null) continue;
         $v = $row[$col];
-        if (in_array($key, ['openInNewTab', 'overlay', 'kenBurns'], true)) $v = (bool) $v;
+        if (in_array($key, ['openInNewTab', 'overlay', 'kenBurns', 'muteVideo'], true)) $v = (bool) $v;
         elseif ($key === 'overlayStrength') $v = (float) $v;
         elseif ($key === 'titleWeight' || $key === 'duration') $v = (int) $v;
         $out[$key] = $v;
@@ -398,11 +406,25 @@ function xs_db_frames_signature($companyId)
         $stmt = $pdo->prepare('SELECT COUNT(*) AS n, MAX(updated_at) AS u FROM frames WHERE company_id = ?');
         $stmt->execute([$companyId]);
         $row = $stmt->fetch();
+        // Also folds in site_settings' own updated_at — the shared table (Table Settings' content/
+        // style, used by every frame with it switched on) lives there, not in any frames row, so an
+        // already-open live show polling this signature would otherwise never notice a table-only
+        // edit (nothing in `frames` changed) and never auto-reload to pick it up.
+        $settingsStmt = $pdo->prepare('SELECT updated_at FROM site_settings WHERE company_id = ?');
+        $settingsStmt->execute([$companyId]);
+        $settingsUpdated = $settingsStmt->fetchColumn();
+        // And tags: a table cell showing {{name}} re-resolves it fresh on every render, so editing
+        // a tag's value changes what the table shows without touching the table's own JSON at all.
+        // Count, not just MAX(updated_at), so deleting a tag (which can leave the remaining rows'
+        // MAX unchanged) still changes the signature.
+        $tagsStmt = $pdo->prepare('SELECT COUNT(*) AS n, MAX(updated_at) AS u FROM tags WHERE company_id = ?');
+        $tagsStmt->execute([$companyId]);
+        $tagsRow = $tagsStmt->fetch();
     } catch (Throwable $e) {
         return null;
     }
     if (!$row) return null;
-    return $row['n'] . ':' . $row['u'];
+    return $row['n'] . ':' . $row['u'] . ':' . $settingsUpdated . ':' . $tagsRow['n'] . ':' . $tagsRow['u'];
 }
 
 /** All of one company's frames, in display order. Empty array if the database is unreachable or has none. */
@@ -517,6 +539,7 @@ function xs_settings_column_map()
         'screenWidth' => 'screen_width',
         'screenHeight' => 'screen_height',
         'companyTable' => 'company_table',
+        'rateConfig' => 'rate_config',
     ];
 }
 
@@ -617,14 +640,14 @@ function xs_db_frame_defaults()
     if ($cols === null) return null;
     $keys = [
         'textAlign', 'verticalAlign', 'offsetX', 'offsetY', 'overlay', 'overlayStrength', 'overlayDirection',
-        'focalPoint', 'mobileFocalPoint', 'textColor', 'fontFamily', 'titleSize', 'titleWeight', 'kenBurns', 'openInNewTab',
+        'focalPoint', 'mobileFocalPoint', 'textColor', 'fontFamily', 'titleSize', 'titleWeight', 'kenBurns', 'openInNewTab', 'muteVideo',
     ];
     $map = xs_frame_column_map();
     $out = [];
     foreach ($keys as $key) {
         $v = $cols[$map[$key]] ?? null;
         if ($v !== null) {
-            if (in_array($key, ['overlay', 'kenBurns', 'openInNewTab'], true)) $v = (bool) $v;
+            if (in_array($key, ['overlay', 'kenBurns', 'openInNewTab', 'muteVideo'], true)) $v = (bool) $v;
             elseif ($key === 'overlayStrength') $v = (float) $v;
             elseif ($key === 'titleWeight') $v = (int) $v;
         }

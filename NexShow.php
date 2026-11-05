@@ -20,9 +20,9 @@ $slider = xs_db_slider_defaults() ?? [
 // ---------- Per-slide defaults (normally read from the frames table's own column defaults) ----------
 $slideDefaults = xs_db_frame_defaults() ?? [
     'textAlign' => 'left', 'verticalAlign' => 'center', 'offsetX' => '0px', 'offsetY' => '0px',
-    'overlay' => true, 'overlayStrength' => 0.55, 'overlayDirection' => 'auto', 'focalPoint' => '50% 50%',
+    'overlay' => false, 'overlayStrength' => 0.55, 'overlayDirection' => 'auto', 'focalPoint' => '50% 50%',
     'mobileFocalPoint' => null, 'textColor' => '#ffffff', 'fontFamily' => null, 'titleSize' => null,
-    'titleWeight' => null, 'kenBurns' => true, 'openInNewTab' => false,
+    'titleWeight' => null, 'kenBurns' => true, 'openInNewTab' => false, 'muteVideo' => false,
 ];
 
 // ---------- Slides ----------
@@ -52,6 +52,41 @@ function img_url($src)
     return $src ? $src : null;
 }
 
+// The only things that should ever sign a device out: device_logout, a fresh login elsewhere
+// (overwrites device_session_token), the account being deactivated, or the account expiring —
+// never just time passing. XS_DEVICE_SESSION_DAYS is how long both the cookie and its
+// server-side session data are kept, in service of that; 400 days because Chrome silently caps
+// any cookie's Expires/Max-Age there regardless of what's sent, so asking for longer buys nothing.
+define('XS_DEVICE_SESSION_DAYS', 400);
+
+/** Starts the 'nexshow_device' session with a cookie lifetime (and matching server-side session
+ *  retention — see below) long enough that it only ever ends for one of the reasons above, never
+ *  just from time passing. Call this (after session_name('nexshow_device')) everywhere that
+ *  session is started: the kiosk/TV login below and the live show's own polling loop (?show=1)
+ *  both touch it, and PHP re-sends the Set-Cookie header (refreshing its expiry) on every one of
+ *  those calls — so leaving either call site on PHP's bare defaults would quietly reset the
+ *  cookie back to "expires when the browser closes" the next time that path runs. That bit
+ *  desktop browsers rarely notice (they stay open), but it's exactly what happens on something
+ *  like a BlueStacks instance, whose browser/webview process gets killed and relaunched rather
+ *  than staying open, forcing a fresh login every time. */
+function xs_device_session_start()
+{
+    $seconds = 60 * 60 * 24 * XS_DEVICE_SESSION_DAYS;
+    // session.gc_maxlifetime is PHP's OWN cookie lifetime — the server-side session data behind
+    // the cookie is normally garbage-collected after ~24 minutes of inactivity (its default),
+    // independently of how long the cookie itself says it's good for. Without raising this too,
+    // a device left off overnight would come back to a still-valid cookie pointing at session
+    // data that's already gone — logged out for no reason on this list either.
+    ini_set('session.gc_maxlifetime', (string) $seconds);
+    session_set_cookie_params([
+        'lifetime' => $seconds,
+        'httponly' => true,
+        'samesite' => 'Lax',
+        'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+    ]);
+    session_start();
+}
+
 /** Merges one company's real settings + frames onto the schema-default fallbacks.
  *  Returns [$pageTitle, $slider, $slides, $dbSettings]. */
 function xs_load_company($companyId, $pageTitle, $slider, $slides)
@@ -79,12 +114,7 @@ function xs_load_company($companyId, $pageTitle, $slider, $slides)
 // =====================================================================
 if (!isset($_GET['show']) && !isset($_GET['preview'])) {
     session_name('nexshow_device');
-    session_set_cookie_params([
-        'httponly' => true,
-        'samesite' => 'Lax',
-        'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
-    ]);
-    session_start();
+    xs_device_session_start();
     header('X-Frame-Options: SAMEORIGIN');
     header('Referrer-Policy: same-origin');
 
@@ -705,7 +735,7 @@ if (isset($_GET['preview'])) {
     }
 } else {
     session_name('nexshow_device');
-    session_start();
+    xs_device_session_start();
     $deviceOk = !empty($_SESSION['xs_device_auth']) && !empty($_SESSION['xs_device_company_id']) && !empty($_SESSION['xs_device_user_id']);
     $deviceExpired = false;
     $deviceKicked = false;
@@ -766,56 +796,33 @@ if (isset($_GET['check'])) {
     exit;
 }
 
-$dbSettings = null;
 if ($companyId !== null) {
-    [$pageTitle, $slider, $slides, $dbSettings] = xs_load_company($companyId, $pageTitle, $slider, $slides);
-}
-
-// The preview iframe for admin.php's Table Settings page isn't editing any one frame, so it
-// borrows a real frame's picture (?previewFrame=<id>, a plain "show image behind the table" pick,
-// not that frame's own table on/off setting) purely as a backdrop — table forced on regardless of
-// what that frame actually has it set to. No match (or no frames yet) falls back to no image.
-if (isset($_GET['preview']) && !empty($_GET['tableonly'])) {
-    $previewFrameId = (string) ($_GET['previewFrame'] ?? '');
-    $base = [];
-    if ($previewFrameId !== '') {
-        foreach ($slides as $fr) {
-            if (($fr['id'] ?? '') === $previewFrameId) { $base = $fr; break; }
-        }
-    }
-    $slides = [array_merge($slideDefaults, $base, ['id' => '__table_preview__', 'tableData' => json_encode(['enabled' => true])])];
+    [$pageTitle, $slider, $slides] = xs_load_company($companyId, $pageTitle, $slider, $slides);
 }
 
 $count = count($slides);
 $bp = (int) $slider['mobileBreakpoint'];
 $autoOverlay = ['left' => 'left', 'right' => 'right', 'center' => 'full'];
-$tags = xs_db_list_tags((int) $companyId); // {{name}} placeholders usable inside the shared table's cells
-$companyTableJson = $dbSettings['settings']['companyTable'] ?? null; // the one shared table, built in admin.php's Table Settings
+$tags = xs_db_list_tags((int) $companyId); // {{name}} placeholders usable inside a frame's table cells — the one thing still shared company-wide
 
-/** True if a frame's own tableData says to show the shared table (the frame itself only ever
- *  stores this one on/off flag — the table's actual content/styling is company-wide). */
-function xs_frame_wants_table($json)
-{
-    if (!$json) return false;
-    $t = json_decode($json, true);
-    return is_array($t) && !empty($t['enabled']);
-}
-
-/** Decodes the shared company table JSON into a safe, well-shaped array, or null if there's no table to show. */
+/** Decodes a frame's own tableData JSON into a safe, well-shaped array, or null if there's no table to show. */
 function xs_frame_table($json, array $tags)
 {
     if (!$json) return null;
     $t = json_decode($json, true);
-    if (!is_array($t) || empty($t['enabled']) || empty($t['rows']) || !is_array($t['rows'])) return null;
+    if (!is_array($t)) return null;
 
+    // Labels are independent of the table itself — a frame can show just labels with the table
+    // off, so only bail out here if NEITHER has anything to show.
     $rows = [];
-    foreach ($t['rows'] as $row) {
-        if (!is_array($row)) continue;
-        $cells = [];
-        foreach ($row as $cell) $cells[] = xs_apply_tags((string) $cell, $tags);
-        if ($cells) $rows[] = $cells;
+    if (!empty($t['enabled']) && !empty($t['rows']) && is_array($t['rows'])) {
+        foreach ($t['rows'] as $row) {
+            if (!is_array($row)) continue;
+            $cells = [];
+            foreach ($row as $cell) $cells[] = xs_apply_tags((string) $cell, $tags);
+            if ($cells) $rows[] = $cells;
+        }
     }
-    if (!$rows) return null;
 
     $hex = function ($v, $fallback) {
         $v = (string) $v;
@@ -825,6 +832,23 @@ function xs_frame_table($json, array $tags)
         $v = trim((string) $v);
         return preg_match('/^-?\d+(\.\d+)?(px|%|rem|em|vw|vh)$/', $v) ? $v : $fallback;
     };
+
+    $labels = [];
+    foreach ((array) ($t['labels'] ?? []) as $lbl) {
+        if (!is_array($lbl)) continue;
+        $text = xs_apply_tags((string) ($lbl['text'] ?? ''), $tags);
+        if ($text === '') continue; // a tag that resolved to nothing just skips this label
+        $labels[] = [
+            'text'     => $text,
+            'hAlign'   => in_array($lbl['hAlign'] ?? '', ['left', 'center', 'right'], true) ? $lbl['hAlign'] : 'center',
+            'vAlign'   => in_array($lbl['vAlign'] ?? '', ['top', 'center', 'bottom'], true) ? $lbl['vAlign'] : 'center',
+            'offsetX'  => $len($lbl['offsetX'] ?? '', '0px'),
+            'offsetY'  => $len($lbl['offsetY'] ?? '', '0px'),
+            'fontSize' => max(10, min(200, (int) ($lbl['fontSize'] ?? 20))),
+            'color'    => $hex($lbl['color'] ?? '', '#ffffff'),
+        ];
+    }
+    if (!$rows && !$labels) return null;
     // One optional hex (or null for "no tint") per row/column, capped to the grid's actual size.
     $hexList = function ($list, $n) use ($hex) {
         $out = [];
@@ -834,7 +858,7 @@ function xs_frame_table($json, array $tags)
         }
         return $out;
     };
-    $cols = max(array_map('count', $rows));
+    $cols = $rows ? max(array_map('count', $rows)) : 0;
 
     return [
         'rows'           => $rows,
@@ -850,11 +874,19 @@ function xs_frame_table($json, array $tags)
         'headerFontSize' => max(10, min(200, (int) ($t['headerFontSize'] ?? $t['fontSize'] ?? 16))),
         'textColor'      => $hex($t['textColor'] ?? '', '#ffffff'),
         'headerColor'    => $hex($t['headerColor'] ?? '', '#ff2d8f'),
+        'headerBgOpacity' => max(0, min(1, (float) ($t['headerBgOpacity'] ?? 0))),
         'borderColor'    => $hex($t['borderColor'] ?? '', '#ffffff'),
         'borderWidth'    => max(0, min(8, (int) ($t['borderWidth'] ?? 1))),
+        'bgColor'        => $hex($t['bgColor'] ?? '', '#0a0908'),
         'bgOpacity'      => max(0, min(1, (float) ($t['bgOpacity'] ?? 0.55))),
         'rowColors'      => $hexList($t['rowColors'] ?? [], count($rows)),
         'colColors'      => $hexList($t['colColors'] ?? [], $cols),
+        'title'          => xs_apply_tags((string) ($t['title'] ?? ''), $tags),
+        'footer'         => xs_apply_tags((string) ($t['footer'] ?? ''), $tags),
+        'bannerColor'     => $hex($t['bannerColor'] ?? '', '#4a0f12'),
+        'bannerTextColor' => $hex($t['bannerTextColor'] ?? '', '#c9a04e'),
+        'footerColor'     => $hex($t['footerColor'] ?? '', '#c9a04e'),
+        'labels'          => $labels,
     ];
 }
 
@@ -868,7 +900,7 @@ foreach ($slides as $i => $slide) {
     $s['mobileUrl'] = img_url($s['mobileImage'] ?? null);
     $s['imageIsVideo'] = xs_is_video_path($s['image'] ?? ''); // the image field doubles as a video upload
     $s['overlayDir'] = $s['overlayDirection'] === 'auto' ? ($autoOverlay[$s['textAlign']] ?? 'full') : $s['overlayDirection'];
-    $s['table'] = xs_frame_wants_table($s['tableData'] ?? null) ? xs_frame_table($companyTableJson, $tags) : null;
+    $s['table'] = xs_frame_table($s['tableData'] ?? null, $tags);
 
     $vars = [
         '--focal'        => $s['focalPoint'],
@@ -907,6 +939,11 @@ $jsConfig = [
     // Only the real show polls for frame changes and auto-reloads — not the admin preview iframe.
     'checkUrl'       => (isset($_GET['show']) && $companyId !== null) ? 'NexShow.php?show=1&check=1' : null,
     'initialSig'     => $companyId !== null ? xs_db_frames_signature($companyId) : null,
+    // admin.php's frame-edit preview shows exactly one frame — no swipe/arrow/dot navigation to
+    // any other frame, and (more importantly) no swipe-to-change-slide gesture competing with
+    // dragging the title or table there: a drag that happened to cross swipeThreshold horizontally
+    // was also being read as a swipe, jumping the preview to a different frame mid-drag.
+    'isPreview'      => isset($_GET['preview']),
 ];
 ?><!doctype html>
 <html lang="en">
@@ -1149,7 +1186,7 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
 .slide__table-wrap {
   width: 100%;
   height: 100%;
-  background: rgba(10, 9, 8, var(--table-bg-opacity, 0.55));
+  background: rgba(var(--table-bg-color, 10, 9, 8), var(--table-bg-opacity, 0.55));
   backdrop-filter: blur(calc(6px * var(--table-bg-opacity, 0.55)));
   -webkit-backdrop-filter: blur(calc(6px * var(--table-bg-opacity, 0.55)));
   border-radius: var(--table-radius, 0px);
@@ -1193,12 +1230,83 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
 /* A set width (rather than auto) only sticks if the table actually distributes columns to fit it. */
 .slide__table--sized { table-layout: fixed; }
 .slide__table--sized td, .slide__table--sized th { white-space: normal; word-break: break-word; }
+/* Header colour transparency slider — 0 (default) is fully see-through, just like before this
+   existed. Turning it up washes the header row in its own Header colour, with Border colour used
+   as the header text so it stays readable once the band is solid. */
 .slide__table tr.is-header th {
-  color: var(--table-header-color, var(--accent));
+  color: var(--table-border-color, var(--table-header-color, var(--accent)));
+  background: rgba(var(--table-header-color-rgb, 0, 0, 0), var(--table-header-bg-opacity, 0));
   font-size: var(--table-header-font-size, var(--table-font-size, inherit));
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.02em;
+}
+/* Optional ornate banner/tagline, only present when a frame's table has a title/footer set — see
+   .slide__table-banner, .slide__table-footer in the markup. Sit as flex siblings of .slide__table-wrap
+   inside .slide__table-pos (which already handles position/size/drag), so they move and resize with
+   the table as one unit without needing their own offset math. */
+.slide__table-pos { display: flex; flex-direction: column; align-items: center; gap: 0.5em; }
+.slide__table-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.5em 1.4em;
+  background: var(--table-banner-color, #4a0f12);
+  color: var(--table-banner-text-color, #fff);
+  border: var(--table-border-width, 1px) solid var(--table-banner-text-color, rgba(255, 255, 255, 0.18));
+  border-radius: 999px;
+  font-family: var(--font-ui);
+  font-size: var(--table-header-font-size, var(--table-font-size, inherit));
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  text-shadow: none;
+}
+.slide__table-banner span { color: var(--table-banner-text-color, currentColor); font-size: 0.9em; }
+.slide__table-footer {
+  display: flex;
+  align-items: center;
+  gap: 0.8em;
+  color: var(--table-footer-color, #fff);
+  font-family: Georgia, 'Times New Roman', serif;
+  font-style: italic;
+  font-size: calc(var(--table-font-size, 1rem) * 0.85);
+  text-shadow: none;
+}
+.slide__table-footer em { font-style: italic; color: var(--table-footer-color, #fff); }
+.slide__table-footer span { opacity: 0.7; letter-spacing: 0.3em; }
+
+/* ---------- Free-floating label ---------- */
+/* A standalone text badge, independent of the table — same layout/position approach
+   (an absolute, full-inset flex layer that places a draggable, offset box inside it) as
+   .slide__table-layout/.slide__table-pos above, just with no card/background of its own. */
+.slide__label-layout {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  padding:
+    calc(clamp(1.5rem, 6vw, 6rem) + env(safe-area-inset-top, 0px))
+    clamp(1.5rem, 7vw, 7.5rem)
+    calc(clamp(5.5rem, 10vh, 8rem) + env(safe-area-inset-bottom, 0px));
+  pointer-events: none;
+}
+.slide__label-layout.v-top { align-items: flex-start; }
+.slide__label-layout.v-center { align-items: center; }
+.slide__label-layout.v-bottom { align-items: flex-end; }
+.slide__label-layout.h-left { justify-content: flex-start; }
+.slide__label-layout.h-center { justify-content: center; }
+.slide__label-layout.h-right { justify-content: flex-end; }
+.slide__label-pos {
+  pointer-events: auto;
+  transform: translate(var(--label-offset-x, 0px), var(--label-offset-y, 0px));
+  max-width: 100%;
+  font-family: var(--font-ui);
+  font-size: var(--label-font-size, 20px);
+  color: var(--label-color, #fff);
+  text-shadow: 0 1px 10px rgba(0, 0, 0, 0.3);
+  white-space: nowrap;
 }
 
 /* ---------- Typography ---------- */
@@ -1471,10 +1579,10 @@ setInterval(function () {
         <img class="slide__img" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" alt="<?= e($s['alt'] ?? '') ?>" loading="<?= $isStart ? 'eager' : 'lazy' ?>" fetchpriority="<?= $isStart ? 'high' : 'auto' ?>" decoding="async" draggable="false" />
 <?php elseif ($s['imageIsVideo'] && $s['mobileUrl']): ?>
         <!-- The uploaded video plays on larger screens; the Phone image covers small ones. -->
-        <video class="slide__img slide__img--video" data-breakpoint="desktop" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
+        <video class="slide__img slide__img--video" data-breakpoint="desktop" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"<?= $s['muteVideo'] ? ' muted data-mute="1"' : '' ?>></video>
         <img class="slide__img" data-breakpoint="mobile" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['mobileUrl']) ?>" alt="<?= e($s['alt'] ?? '') ?>" loading="<?= $isStart ? 'eager' : 'lazy' ?>" decoding="async" draggable="false" />
 <?php elseif ($s['imageIsVideo']): ?>
-        <video class="slide__img slide__img--video" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
+        <video class="slide__img slide__img--video" <?= $near ? 'src' : 'data-src' ?>="<?= e($s['imageUrl']) ?>" loop playsinline preload="auto" aria-hidden="true" tabindex="-1"<?= $s['muteVideo'] ? ' muted data-mute="1"' : '' ?>></video>
 <?php endif; ?>
       </div>
 <?php if ($s['overlay']): ?>
@@ -1497,12 +1605,20 @@ setInterval(function () {
         </div>
       </div>
 <?php if ($s['table']): $tbl = $s['table'];
+    $bgRgb = implode(',', array_map('hexdec', str_split(ltrim($tbl['bgColor'], '#'), 2)));
+    $headerRgb = implode(',', array_map('hexdec', str_split(ltrim($tbl['headerColor'], '#'), 2)));
     $tblStyle = '--table-font-size:' . $tbl['fontSize'] . 'px;'
         . '--table-header-font-size:' . $tbl['headerFontSize'] . 'px;'
         . '--table-text-color:' . $tbl['textColor'] . ';'
         . '--table-header-color:' . $tbl['headerColor'] . ';'
+        . '--table-header-color-rgb:' . $headerRgb . ';'
+        . '--table-header-bg-opacity:' . $tbl['headerBgOpacity'] . ';'
         . '--table-border-color:' . $tbl['borderColor'] . ';'
         . '--table-border-width:' . $tbl['borderWidth'] . 'px;'
+        . '--table-banner-color:' . $tbl['bannerColor'] . ';'
+        . '--table-banner-text-color:' . $tbl['bannerTextColor'] . ';'
+        . '--table-footer-color:' . $tbl['footerColor'] . ';'
+        . '--table-bg-color:' . $bgRgb . ';'
         . '--table-bg-opacity:' . $tbl['bgOpacity'] . ';'
         . '--table-radius:' . ($tbl['rounded'] ? '14px' : '0px') . ';'
         . '--table-offset-x:' . $tbl['offsetX'] . ';'
@@ -1510,8 +1626,12 @@ setInterval(function () {
         . ($tbl['width'] > 0 ? 'width:' . $tbl['width'] . '%;' : '')
         . ($tbl['height'] > 0 ? 'height:' . $tbl['height'] . '%;' : '');
 ?>
+<?php if ($tbl['rows']): ?>
       <div class="slide__table-layout v-<?= e($tbl['vAlign']) ?> h-<?= e($tbl['hAlign']) ?>">
         <div class="slide__table-pos" style="<?= e($tblStyle) ?>">
+<?php if ($tbl['title'] !== ''): ?>
+          <div class="slide__table-banner"><span>&#10022;</span><?= e($tbl['title']) ?><span>&#10022;</span></div>
+<?php endif; ?>
           <div class="slide__table-wrap">
             <table class="slide__table<?= $tbl['width'] > 0 ? ' slide__table--sized' : '' ?>">
 <?php foreach ($tbl['rows'] as $ri => $row):
@@ -1530,13 +1650,27 @@ setInterval(function () {
 <?php endforeach; ?>
             </table>
           </div>
+<?php if ($tbl['footer'] !== ''): ?>
+          <div class="slide__table-footer"><span>&mdash;</span><em><?= e($tbl['footer']) ?></em><span>&mdash;</span></div>
+<?php endif; ?>
         </div>
       </div>
+<?php endif; ?>
+<?php foreach ($tbl['labels'] as $li => $lbl):
+    $labelStyle = '--label-font-size:' . $lbl['fontSize'] . 'px;'
+        . '--label-color:' . $lbl['color'] . ';'
+        . '--label-offset-x:' . $lbl['offsetX'] . ';'
+        . '--label-offset-y:' . $lbl['offsetY'] . ';';
+?>
+      <div class="slide__label-layout v-<?= e($lbl['vAlign']) ?> h-<?= e($lbl['hAlign']) ?>">
+        <div class="slide__label-pos" data-label-index="<?= $li ?>" style="<?= e($labelStyle) ?>"><?= e($lbl['text']) ?></div>
+      </div>
+<?php endforeach; ?>
 <?php endif; ?>
     </div>
 <?php endforeach; ?>
   </div>
-<?php if ($count > 1): ?>
+<?php if ($count > 1 && !isset($_GET['preview'])): ?>
 
   <button type="button" class="ctrl-arrow ctrl-arrow--prev" data-prev aria-label="Previous slide">
     <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>
@@ -1621,7 +1755,7 @@ setInterval(function () {
     document.removeEventListener('keydown', unlockSound);
     slides.forEach(function (el) {
       el.querySelectorAll('.slide__img--video').forEach(function (video) {
-        if (!video.paused) video.muted = false;
+        if (!video.paused && video.dataset.mute !== '1') video.muted = false;
       });
     });
   }
@@ -1636,7 +1770,7 @@ setInterval(function () {
         var canPlay = i === index && !reducedMQ.matches && !tabHidden && video.offsetWidth > 0;
         if (canPlay) {
           if (indexChanged) video.currentTime = 0;
-          video.muted = !soundUnlocked;
+          video.muted = video.dataset.mute === '1' ? true : !soundUnlocked;
           var p = video.play();
           if (p && p.catch) {
             p.catch(function () {
@@ -1766,39 +1900,45 @@ setInterval(function () {
     else if (mq.addListener) mq.addListener(render);
   });
 
-  // Keyboard arrows anywhere on the page (the slider is the page).
-  window.addEventListener('keydown', function (e) {
-    var t = e.target;
-    if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
-    if (e.key === 'ArrowRight') { e.preventDefault(); next(); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
-  });
+  // Keyboard arrows anywhere on the page (the slider is the page). Skipped in admin.php's preview
+  // for the same reason as the swipe handler above.
+  if (!cfg.isPreview) {
+    window.addEventListener('keydown', function (e) {
+      var t = e.target;
+      if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
+      if (e.key === 'ArrowRight') { e.preventDefault(); next(); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); prev(); }
+    });
+  }
 
   // Mouse drag + touch swipe via Pointer Events. Drags starting on a link/button are ignored
-  // so CTAs stay clickable, and a click that ends a drag is swallowed.
-  var start = null, dragged = false;
-  root.addEventListener('pointerdown', function (e) {
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (e.target.closest('a, button')) return;
-    start = { x: e.clientX, y: e.clientY };
-    dragged = false;
-  });
-  root.addEventListener('pointermove', function (e) {
-    if (start && Math.abs(e.clientX - start.x) > 8) dragged = true;
-  });
-  root.addEventListener('pointerup', function (e) {
-    if (!start) return;
-    var dx = e.clientX - start.x, dy = e.clientY - start.y;
-    start = null;
-    if (Math.abs(dx) < cfg.swipeThreshold || Math.abs(dx) < Math.abs(dy)) return;
-    if (dx < 0) next(); else prev();
-  });
-  var cancel = function () { start = null; };
-  root.addEventListener('pointercancel', cancel);
-  root.addEventListener('pointerleave', cancel);
-  root.addEventListener('click', function (e) {
-    if (dragged) { e.preventDefault(); e.stopPropagation(); dragged = false; }
-  }, true);
+  // so CTAs stay clickable, and a click that ends a drag is swallowed. Skipped entirely in
+  // admin.php's preview — see the isPreview note where cfg.isPreview is built above.
+  if (!cfg.isPreview) {
+    var start = null, dragged = false;
+    root.addEventListener('pointerdown', function (e) {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      if (e.target.closest('a, button')) return;
+      start = { x: e.clientX, y: e.clientY };
+      dragged = false;
+    });
+    root.addEventListener('pointermove', function (e) {
+      if (start && Math.abs(e.clientX - start.x) > 8) dragged = true;
+    });
+    root.addEventListener('pointerup', function (e) {
+      if (!start) return;
+      var dx = e.clientX - start.x, dy = e.clientY - start.y;
+      start = null;
+      if (Math.abs(dx) < cfg.swipeThreshold || Math.abs(dx) < Math.abs(dy)) return;
+      if (dx < 0) next(); else prev();
+    });
+    var cancel = function () { start = null; };
+    root.addEventListener('pointercancel', cancel);
+    root.addEventListener('pointerleave', cancel);
+    root.addEventListener('click', function (e) {
+      if (dragged) { e.preventDefault(); e.stopPropagation(); dragged = false; }
+    }, true);
+  }
 
   render();
 
