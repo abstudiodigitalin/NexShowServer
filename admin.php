@@ -233,7 +233,17 @@ function xs_table_from_post(array $p)
         'offsetX' => xs_css($p['tableOffsetX'] ?? '') ?: '0px',
         'offsetY' => xs_css($p['tableOffsetY'] ?? '') ?: '0px',
         'width' => max(0, min(100, (int) ($p['tableWidth'] ?? 0))), // 0 = size to fit the content, like today
-        'height' => max(0, min(100, (int) ($p['tableHeight'] ?? 0))), // 0 = size to fit the content, like today
+        'height' => max(0, min(200, (int) ($p['tableHeight'] ?? 0))), // 0 = size to fit the content, like today; up to 200% so a tall table can extend past the slide's own content height
+        // Phone's own position/size, independent of the TV ones above — same idea as
+        // mobileFocalPoint vs focalPoint for the background image. Each falls back to its TV
+        // counterpart (in xs_frame_table(), NexShow.php's side) whenever it hasn't been set, so
+        // these simply mirror the TV values here until the Phone preview tab below is touched.
+        'mobileHAlign' => xs_enum($p['tableMobileHAlign'] ?? '', ['left', 'center', 'right'], xs_enum($p['tableHAlign'] ?? '', ['left', 'center', 'right'], 'center')),
+        'mobileVAlign' => xs_enum($p['tableMobileVAlign'] ?? '', ['top', 'center', 'bottom'], xs_enum($p['tableVAlign'] ?? '', ['top', 'center', 'bottom'], 'center')),
+        'mobileOffsetX' => xs_css($p['tableMobileOffsetX'] ?? '') ?: (xs_css($p['tableOffsetX'] ?? '') ?: '0px'),
+        'mobileOffsetY' => xs_css($p['tableMobileOffsetY'] ?? '') ?: (xs_css($p['tableOffsetY'] ?? '') ?: '0px'),
+        'mobileWidth' => isset($p['tableMobileWidth']) && $p['tableMobileWidth'] !== '' ? max(0, min(100, (int) $p['tableMobileWidth'])) : max(0, min(100, (int) ($p['tableWidth'] ?? 0))),
+        'mobileHeight' => isset($p['tableMobileHeight']) && $p['tableMobileHeight'] !== '' ? max(0, min(200, (int) $p['tableMobileHeight'])) : max(0, min(200, (int) ($p['tableHeight'] ?? 0))),
         'fontSize' => max(10, min(200, (int) ($p['tableFontSize'] ?? 16))),
         'headerFontSize' => max(10, min(200, (int) ($p['tableHeaderFontSize'] ?? $p['tableFontSize'] ?? 16))),
         'textColor' => $hex($p['tableTextColor'] ?? '', '#ffffff'),
@@ -2707,19 +2717,42 @@ document.addEventListener('DOMContentLoaded', function () {
           <?php xs_color_field('tableFooterColor', 'Footer tagline colour', $table['footerColor'] ?? '#c9a04e', '#c9a04e'); ?>
         </div>
         <div class="row">
-          <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['hAlign'] ?? 'center'); ?></div>
-          <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['vAlign'] ?? 'center'); ?></div>
+          <span class="hint">Position &amp; size below apply to whichever preview size (<?= $tvLabel ?> or Phone) is selected above — each has its own, independent of the other.</span>
         </div>
-        <div class="row">
-          <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x></label>
-          <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y></label>
-        </div>
-        <div class="row">
-          <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($table['width'] ?? 0) ?>" data-table-width><output data-table-width-out><?= e(($table['width'] ?? 0) > 0 ? $table['width'] . '%' : 'Auto') ?></output></div>
+        <div data-table-pos-group="tv">
+          <div class="row">
+            <div class="field"><span>Position, across</span><?php xs_seg('tableHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['hAlign'] ?? 'center'); ?></div>
+            <div class="field"><span>Position, up and down</span><?php xs_seg('tableVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['vAlign'] ?? 'center'); ?></div>
           </div>
-          <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
-            <div class="range-row"><input type="range" name="tableHeight" min="0" max="100" step="5" value="<?= e($table['height'] ?? 0) ?>" data-table-height><output data-table-height-out><?= e(($table['height'] ?? 0) > 0 ? $table['height'] . '%' : 'Auto') ?></output></div>
+          <div class="row">
+            <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetX" value="<?= e($table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x="tv"></label>
+            <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableOffsetY" value="<?= e($table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y="tv"></label>
+          </div>
+          <div class="row">
+            <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
+              <div class="range-row"><input type="range" name="tableWidth" min="0" max="100" step="5" value="<?= e($table['width'] ?? 0) ?>" data-table-width="tv"><output data-table-width-out="tv"><?= e(($table['width'] ?? 0) > 0 ? $table['width'] . '%' : 'Auto') ?></output></div>
+            </div>
+            <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
+              <div class="range-row"><input type="range" name="tableHeight" min="0" max="200" step="5" value="<?= e($table['height'] ?? 0) ?>" data-table-height="tv"><output data-table-height-out="tv"><?= e(($table['height'] ?? 0) > 0 ? $table['height'] . '%' : 'Auto') ?></output></div>
+            </div>
+          </div>
+        </div>
+        <div data-table-pos-group="phone" hidden>
+          <div class="row">
+            <div class="field"><span>Position, across</span><?php xs_seg('tableMobileHAlign', ['left' => 'Left', 'center' => 'Center', 'right' => 'Right'], $table['mobileHAlign'] ?? $table['hAlign'] ?? 'center'); ?></div>
+            <div class="field"><span>Position, up and down</span><?php xs_seg('tableMobileVAlign', ['top' => 'Top', 'center' => 'Middle', 'bottom' => 'Bottom'], $table['mobileVAlign'] ?? $table['vAlign'] ?? 'center'); ?></div>
+          </div>
+          <div class="row">
+            <label class="field"><span>Nudge sideways <em>or drag the table in the preview</em></span><input type="text" name="tableMobileOffsetX" value="<?= e($table['mobileOffsetX'] ?? $table['offsetX'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-x="phone"></label>
+            <label class="field"><span>Nudge up / down <em>or drag the table in the preview</em></span><input type="text" name="tableMobileOffsetY" value="<?= e($table['mobileOffsetY'] ?? $table['offsetY'] ?? '0px') ?>" placeholder="0px" spellcheck="false" data-table-offset-y="phone"></label>
+          </div>
+          <div class="row">
+            <div class="field"><span>Table width <em>or drag a point on the preview</em></span>
+              <div class="range-row"><input type="range" name="tableMobileWidth" min="0" max="100" step="5" value="<?= e($table['mobileWidth'] ?? $table['width'] ?? 0) ?>" data-table-width="phone"><output data-table-width-out="phone"><?= e(($table['mobileWidth'] ?? $table['width'] ?? 0) > 0 ? ($table['mobileWidth'] ?? $table['width']) . '%' : 'Auto') ?></output></div>
+            </div>
+            <div class="field"><span>Table height <em>or drag a point on the preview</em></span>
+              <div class="range-row"><input type="range" name="tableMobileHeight" min="0" max="200" step="5" value="<?= e($table['mobileHeight'] ?? $table['height'] ?? 0) ?>" data-table-height="phone"><output data-table-height-out="phone"><?= e(($table['mobileHeight'] ?? $table['height'] ?? 0) > 0 ? ($table['mobileHeight'] ?? $table['height']) . '%' : 'Auto') ?></output></div>
+            </div>
           </div>
         </div>
         <div class="row">
@@ -3177,21 +3210,17 @@ document.addEventListener('DOMContentLoaded', function () {
     dlg.querySelectorAll('[data-close]').forEach(function (b) { b.addEventListener('click', function () { dlg.close(); }); });
   })();
 
-  // Table width/height: 0 reads as "Auto" (size to fit the content) instead of "0%".
-  var widthSlider = form.querySelector('[data-table-width]');
-  if (widthSlider) {
-    var widthOut = form.querySelector('[data-table-width-out]');
-    widthSlider.addEventListener('input', function () {
-      widthOut.textContent = widthSlider.value > 0 ? widthSlider.value + '%' : 'Auto';
-    });
-  }
-  var heightSlider = form.querySelector('[data-table-height]');
-  if (heightSlider) {
-    var heightOut = form.querySelector('[data-table-height-out]');
-    heightSlider.addEventListener('input', function () {
-      heightOut.textContent = heightSlider.value > 0 ? heightSlider.value + '%' : 'Auto';
-    });
-  }
+  // Table width/height: 0 reads as "Auto" (size to fit the content) instead of "0%". (TV/Phone
+  // each have their own slider+output — see the [data-preview] block further down for the rest
+  // of their wiring, which needs `mode` to know which one the live preview should reflect.)
+  ['tv', 'phone'].forEach(function (m) {
+    var slider = form.querySelector('[data-table-width="' + m + '"]');
+    var out = form.querySelector('[data-table-width-out="' + m + '"]');
+    if (slider && out) slider.addEventListener('input', function () { out.textContent = slider.value > 0 ? slider.value + '%' : 'Auto'; });
+    var hSlider = form.querySelector('[data-table-height="' + m + '"]');
+    var hOut = form.querySelector('[data-table-height-out="' + m + '"]');
+    if (hSlider && hOut) hSlider.addEventListener('input', function () { hOut.textContent = hSlider.value > 0 ? hSlider.value + '%' : 'Auto'; });
+  });
 
   // The Phone portrait image starts tucked behind the "Portrait mode" button (most frames just
   // use the one photo/video for every screen) — click reveals the field in its place, same as the
@@ -3658,10 +3687,41 @@ document.addEventListener('DOMContentLoaded', function () {
     var deviceW = parseInt(pv.dataset.deviceW, 10) || 0;
     var deviceH = parseInt(pv.dataset.deviceH, 10) || 0;
     var points = pv.querySelectorAll('[data-table-point]');
-    var offsetXInput = form.querySelector('[data-table-offset-x]');
-    var offsetYInput = form.querySelector('[data-table-offset-y]');
     var textOffsetXInput = form.querySelector('[data-text-offset-x]');
     var textOffsetYInput = form.querySelector('[data-text-offset-y]');
+    var tvPosGroup = form.querySelector('[data-table-pos-group="tv"]');
+    var phonePosGroup = form.querySelector('[data-table-pos-group="phone"]');
+    // The table's own position/size inputs (offset, width, height) come in TV and Phone pairs —
+    // see the two [data-table-pos-group] blocks in Table Settings. Resolved fresh by mode rather
+    // than cached once, since switching the TV/Phone preview radio doesn't reload the iframe (just
+    // rescales it — see fit()), so a drag started after switching modes needs this re-evaluated,
+    // not whatever it was at page load.
+    function posFields() {
+      var m = mode === 'phone' ? 'phone' : 'tv';
+      return {
+        offsetX: form.querySelector('[data-table-offset-x="' + m + '"]'),
+        offsetY: form.querySelector('[data-table-offset-y="' + m + '"]'),
+        width: form.querySelector('[data-table-width="' + m + '"]'),
+        height: form.querySelector('[data-table-height="' + m + '"]'),
+        widthOut: form.querySelector('[data-table-width-out="' + m + '"]'),
+        heightOut: form.querySelector('[data-table-height-out="' + m + '"]'),
+        offsetXProp: m === 'phone' ? '--table-offset-x-mobile' : '--table-offset-x',
+        offsetYProp: m === 'phone' ? '--table-offset-y-mobile' : '--table-offset-y',
+        widthProp: m === 'phone' ? '--table-width-mobile' : '--table-width',
+        heightProp: m === 'phone' ? '--table-height-mobile' : '--table-height',
+      };
+    }
+    // The "is this table set to a fixed size at all" class (word-wrapping etc.) is shared by one
+    // <table> element for both TV and Phone — it has to stay on if EITHER one has a width set,
+    // since whichever is hidden by the current @media breakpoint still applies the moment the
+    // viewport crosses it.
+    function updateSizedClass() {
+      var els = tableEls();
+      if (!els) return;
+      var wTv = parseInt((form.querySelector('[data-table-width="tv"]') || {}).value, 10) || 0;
+      var wPhone = parseInt((form.querySelector('[data-table-width="phone"]') || {}).value, 10) || 0;
+      els.table.classList.toggle('slide__table--sized', wTv > 0 || wPhone > 0);
+    }
     var curScale = 1, curLeft = 0;
     // Dragging the title/description block itself nudges offsetX/offsetY — the same desktop-only
     // nudge the Text card's own inputs write to. Bound fresh on every load since the iframe's
@@ -3719,7 +3779,7 @@ document.addEventListener('DOMContentLoaded', function () {
       var active = doc.querySelector('.slide.is-active');
       var wrap = active && active.querySelector('.slide__table-pos');
       if (!wrap) return;
-      if (!offsetXInput || !offsetYInput) {
+      if (!form.querySelector('[data-table-offset-x="tv"]')) {
         // This page has nothing to drag the table's position into (that now lives on the Table
         // Settings page only) — but NexShow.php's own CSS still gives .slide__table-pos
         // pointer-events:auto so IT can be dragged there, which on THIS page just means it sits
@@ -3731,19 +3791,21 @@ document.addEventListener('DOMContentLoaded', function () {
       }
       wrap.style.cursor = 'grab';
       wrap.addEventListener('pointerdown', function (e) {
+        var f = posFields();
+        if (!f.offsetX || !f.offsetY) return;
         e.preventDefault();
         var startX = e.clientX, startY = e.clientY;
-        var startOffsetX = parseFloat(offsetXInput.value) || 0;
-        var startOffsetY = parseFloat(offsetYInput.value) || 0;
+        var startOffsetX = parseFloat(f.offsetX.value) || 0;
+        var startOffsetY = parseFloat(f.offsetY.value) || 0;
         wrap.setPointerCapture(e.pointerId);
         wrap.style.cursor = 'grabbing';
         function onMove(ev) {
           var nx = Math.round(startOffsetX + (ev.clientX - startX));
           var ny = Math.round(startOffsetY + (ev.clientY - startY));
-          wrap.style.setProperty('--table-offset-x', nx + 'px');
-          wrap.style.setProperty('--table-offset-y', ny + 'px');
-          offsetXInput.value = nx + 'px';
-          offsetYInput.value = ny + 'px';
+          wrap.style.setProperty(f.offsetXProp, nx + 'px');
+          wrap.style.setProperty(f.offsetYProp, ny + 'px');
+          f.offsetX.value = nx + 'px';
+          f.offsetY.value = ny + 'px';
           placePoints();
         }
         function onUp(ev) {
@@ -3751,8 +3813,8 @@ document.addEventListener('DOMContentLoaded', function () {
           wrap.releasePointerCapture(ev.pointerId);
           doc.removeEventListener('pointermove', onMove);
           doc.removeEventListener('pointerup', onUp);
-          offsetXInput.dispatchEvent(new Event('input', { bubbles: true }));
-          offsetYInput.dispatchEvent(new Event('change', { bubbles: true }));
+          f.offsetX.dispatchEvent(new Event('input', { bubbles: true }));
+          f.offsetY.dispatchEvent(new Event('change', { bubbles: true }));
         }
         doc.addEventListener('pointermove', onMove);
         doc.addEventListener('pointerup', onUp);
@@ -3901,10 +3963,18 @@ document.addEventListener('DOMContentLoaded', function () {
         els.wrap.style.setProperty('--table-radius', roundedCheckbox.checked ? '14px' : '0px');
       });
     }
-    [[offsetXInput, '--table-offset-x'], [offsetYInput, '--table-offset-y']].forEach(function (pair) {
+    [
+      [form.querySelector('[data-table-offset-x="tv"]'), '--table-offset-x'],
+      [form.querySelector('[data-table-offset-y="tv"]'), '--table-offset-y'],
+      [form.querySelector('[data-table-offset-x="phone"]'), '--table-offset-x-mobile'],
+      [form.querySelector('[data-table-offset-y="phone"]'), '--table-offset-y-mobile'],
+    ].forEach(function (pair) {
       var input = pair[0], prop = pair[1];
       if (!input) return;
       // Typing a nudge value directly also live-updates the preview, the same as dragging does.
+      // Each input always writes its own named property, regardless of which mode the preview is
+      // currently showing — the @media rule in NexShow.php's own stylesheet (not this page) is
+      // what decides which one the iframe actually uses at its current width.
       input.addEventListener('input', function () {
         var els = tableEls();
         if (!els) return;
@@ -3924,74 +3994,85 @@ document.addEventListener('DOMContentLoaded', function () {
       });
     });
     // A size slider's own typing/dragging also live-updates the preview, same as a point does
-    // (its own output label is kept in sync separately, where the slider is first set up).
-    [[widthSlider, 'width', 'slide__table--sized'], [heightSlider, 'height', null]].forEach(function (cfg) {
-      var slider = cfg[0], prop = cfg[1], sizedClass = cfg[2];
+    // (its own "Auto"/"X%" output label is kept in sync separately, above where the sliders are
+    // first set up). Same TV/Phone-pair shape as the offset inputs just above.
+    [
+      [form.querySelector('[data-table-width="tv"]'), '--table-width'],
+      [form.querySelector('[data-table-height="tv"]'), '--table-height'],
+      [form.querySelector('[data-table-width="phone"]'), '--table-width-mobile'],
+      [form.querySelector('[data-table-height="phone"]'), '--table-height-mobile'],
+    ].forEach(function (pair) {
+      var slider = pair[0], prop = pair[1];
       if (!slider) return;
       slider.addEventListener('input', function () {
         var els = tableEls();
         if (!els) return;
         var pct = parseInt(slider.value, 10) || 0;
-        els.wrap.style[prop] = pct > 0 ? pct + '%' : '';
-        if (sizedClass) els.table.classList.toggle(sizedClass, pct > 0);
+        els.wrap.style.setProperty(prop, pct > 0 ? pct + '%' : 'auto');
+        updateSizedClass();
         placePoints();
       });
     });
-    if (widthSlider && heightSlider) {
-      points.forEach(function (p) {
-        var axis = POINT_AXIS[p.dataset.dir];
-        p.addEventListener('pointerdown', function (e) {
-          var els = tableEls();
-          if (!els) return;
-          var startX = e.clientX, startY = e.clientY;
-          var startRect = els.wrap.getBoundingClientRect();
-          var layoutRect = els.layout.getBoundingClientRect();
-          var layoutCs = els.doc.defaultView.getComputedStyle(els.layout);
-          var contentWidth = layoutRect.width - parseFloat(layoutCs.paddingLeft) - parseFloat(layoutCs.paddingRight);
-          var contentHeight = layoutRect.height - parseFloat(layoutCs.paddingTop) - parseFloat(layoutCs.paddingBottom);
-          p.classList.add('is-dragging');
-          p.setPointerCapture(e.pointerId);
-          function onMove(ev) {
-            if (axis.x !== 0) {
-              var deltaW = axis.x * (ev.clientX - startX) / curScale;
-              var pctW = Math.max(5, Math.min(100, Math.round((startRect.width + deltaW) / contentWidth * 100)));
-              els.wrap.style.width = pctW + '%';
-              els.table.classList.add('slide__table--sized');
-              widthSlider.value = pctW;
-              widthOut.textContent = pctW + '%';
-            }
-            if (axis.y !== 0) {
-              var deltaH = axis.y * (ev.clientY - startY) / curScale;
-              var pctH = Math.max(5, Math.min(100, Math.round((startRect.height + deltaH) / contentHeight * 100)));
-              els.wrap.style.height = pctH + '%';
-              heightSlider.value = pctH;
-              heightOut.textContent = pctH + '%';
-            }
-            placePoints();
+    points.forEach(function (p) {
+      var axis = POINT_AXIS[p.dataset.dir];
+      p.addEventListener('pointerdown', function (e) {
+        var els = tableEls();
+        var f = posFields();
+        if (!els || !f.width || !f.height) return;
+        var startX = e.clientX, startY = e.clientY;
+        var startRect = els.wrap.getBoundingClientRect();
+        var layoutRect = els.layout.getBoundingClientRect();
+        var layoutCs = els.doc.defaultView.getComputedStyle(els.layout);
+        var contentWidth = layoutRect.width - parseFloat(layoutCs.paddingLeft) - parseFloat(layoutCs.paddingRight);
+        var contentHeight = layoutRect.height - parseFloat(layoutCs.paddingTop) - parseFloat(layoutCs.paddingBottom);
+        p.classList.add('is-dragging');
+        p.setPointerCapture(e.pointerId);
+        function onMove(ev) {
+          if (axis.x !== 0) {
+            var deltaW = axis.x * (ev.clientX - startX) / curScale;
+            var pctW = Math.max(5, Math.min(100, Math.round((startRect.width + deltaW) / contentWidth * 100)));
+            els.wrap.style.setProperty(f.widthProp, pctW + '%');
+            els.table.classList.add('slide__table--sized');
+            f.width.value = pctW;
+            if (f.widthOut) f.widthOut.textContent = pctW + '%';
           }
-          function onUp(ev) {
-            p.classList.remove('is-dragging');
-            p.releasePointerCapture(ev.pointerId);
-            document.removeEventListener('pointermove', onMove);
-            document.removeEventListener('pointerup', onUp);
-            if (axis.x !== 0) {
-              widthSlider.dispatchEvent(new Event('input', { bubbles: true }));
-              widthSlider.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-            if (axis.y !== 0) {
-              heightSlider.dispatchEvent(new Event('input', { bubbles: true }));
-              heightSlider.dispatchEvent(new Event('change', { bubbles: true }));
-            }
+          if (axis.y !== 0) {
+            var deltaH = axis.y * (ev.clientY - startY) / curScale;
+            var pctH = Math.max(5, Math.min(200, Math.round((startRect.height + deltaH) / contentHeight * 100)));
+            els.wrap.style.setProperty(f.heightProp, pctH + '%');
+            f.height.value = pctH;
+            if (f.heightOut) f.heightOut.textContent = pctH + '%';
           }
-          document.addEventListener('pointermove', onMove);
-          document.addEventListener('pointerup', onUp);
-          e.preventDefault();
-        });
+          placePoints();
+        }
+        function onUp(ev) {
+          p.classList.remove('is-dragging');
+          p.releasePointerCapture(ev.pointerId);
+          document.removeEventListener('pointermove', onMove);
+          document.removeEventListener('pointerup', onUp);
+          if (axis.x !== 0) {
+            f.width.dispatchEvent(new Event('input', { bubbles: true }));
+            f.width.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+          if (axis.y !== 0) {
+            f.height.dispatchEvent(new Event('input', { bubbles: true }));
+            f.height.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        e.preventDefault();
       });
-    }
+    });
 
     document.querySelectorAll('[data-pv]').forEach(function (r) {
-      r.addEventListener('change', function () { if (r.checked) { mode = r.value; fit(); } });
+      r.addEventListener('change', function () {
+        if (!r.checked) return;
+        mode = r.value;
+        if (tvPosGroup) tvPosGroup.hidden = mode !== 'tv';
+        if (phonePosGroup) phonePosGroup.hidden = mode !== 'phone';
+        fit();
+      });
     });
     window.addEventListener('resize', fit);
     fit();

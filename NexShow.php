@@ -860,16 +860,34 @@ function xs_frame_table($json, array $tags)
     };
     $cols = $rows ? max(array_map('count', $rows)) : 0;
 
+    $hAlignVal = in_array($t['hAlign'] ?? '', ['left', 'center', 'right'], true) ? $t['hAlign'] : 'center';
+    $vAlignVal = in_array($t['vAlign'] ?? '', ['top', 'center', 'bottom'], true) ? $t['vAlign'] : 'center';
+    $offsetXVal = $len($t['offsetX'] ?? '', '0px');
+    $offsetYVal = $len($t['offsetY'] ?? '', '0px');
+    $widthVal = max(0, min(100, (int) ($t['width'] ?? 0)));
+    $heightVal = max(0, min(200, (int) ($t['height'] ?? 0)));
+
     return [
         'rows'           => $rows,
         'headerRow'      => !empty($t['headerRow']),
         'rounded'        => !empty($t['rounded']),
-        'hAlign'         => in_array($t['hAlign'] ?? '', ['left', 'center', 'right'], true) ? $t['hAlign'] : 'center',
-        'vAlign'         => in_array($t['vAlign'] ?? '', ['top', 'center', 'bottom'], true) ? $t['vAlign'] : 'center',
-        'offsetX'        => $len($t['offsetX'] ?? '', '0px'),
-        'offsetY'        => $len($t['offsetY'] ?? '', '0px'),
-        'width'          => max(0, min(100, (int) ($t['width'] ?? 0))), // 0 = size to fit the content
-        'height'         => max(0, min(100, (int) ($t['height'] ?? 0))), // 0 = size to fit the content
+        'hAlign'         => $hAlignVal,
+        'vAlign'         => $vAlignVal,
+        'offsetX'        => $offsetXVal,
+        'offsetY'        => $offsetYVal,
+        'width'          => $widthVal, // 0 = size to fit the content
+        'height'         => $heightVal, // 0 = size to fit the content
+        // Phone's own position/size — independent of the TV/desktop values above, same as
+        // mobileFocalPoint is independent of focalPoint for the background image. Each one
+        // defaults to its TV counterpart until the admin deliberately sets a phone-specific
+        // value in Table Settings, so an existing table looks exactly as it always did on a
+        // phone until someone opts into customizing it there.
+        'mobileHAlign'   => in_array($t['mobileHAlign'] ?? '', ['left', 'center', 'right'], true) ? $t['mobileHAlign'] : $hAlignVal,
+        'mobileVAlign'   => in_array($t['mobileVAlign'] ?? '', ['top', 'center', 'bottom'], true) ? $t['mobileVAlign'] : $vAlignVal,
+        'mobileOffsetX'  => $len($t['mobileOffsetX'] ?? '', $offsetXVal),
+        'mobileOffsetY'  => $len($t['mobileOffsetY'] ?? '', $offsetYVal),
+        'mobileWidth'    => array_key_exists('mobileWidth', $t) ? max(0, min(100, (int) $t['mobileWidth'])) : $widthVal,
+        'mobileHeight'   => array_key_exists('mobileHeight', $t) ? max(0, min(200, (int) $t['mobileHeight'])) : $heightVal,
         'fontSize'       => max(10, min(200, (int) ($t['fontSize'] ?? 16))),
         'headerFontSize' => max(10, min(200, (int) ($t['headerFontSize'] ?? $t['fontSize'] ?? 16))),
         'textColor'      => $hex($t['textColor'] ?? '', '#ffffff'),
@@ -1158,12 +1176,14 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
     calc(clamp(5.5rem, 10vh, 8rem) + env(safe-area-inset-bottom, 0px));
   pointer-events: none;
 }
-.slide__table-layout.v-top { align-items: flex-start; }
-.slide__table-layout.v-center { align-items: center; }
-.slide__table-layout.v-bottom { align-items: flex-end; }
-.slide__table-layout.h-left { justify-content: flex-start; }
-.slide__table-layout.h-center { justify-content: center; }
-.slide__table-layout.h-right { justify-content: flex-end; }
+/* hAlign/vAlign drive these through custom properties (--table-h-align/--table-v-align, set
+   inline per-frame) rather than modifier classes, so the @media rule further down can swap in
+   the -mobile variant below the breakpoint — a plain class couldn't do that without a second,
+   duplicate copy of every h-*/v-* rule gated behind the same media query. */
+.slide__table-layout {
+  justify-content: var(--table-h-align, center);
+  align-items: var(--table-v-align, center);
+}
 /* The background/blur, size and rounding live on .slide__table-wrap rather than the <table> itself
    — a table using border-collapse ignores border-radius/overflow on its own box in most browsers,
    so corners never actually clipped when those lived directly on .slide__table. The position nudge
@@ -1173,6 +1193,8 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
 .slide__table-pos {
   pointer-events: auto;
   transform: translate(var(--table-offset-x, 0px), var(--table-offset-y, 0px));
+  width: var(--table-width, auto);
+  height: var(--table-height, auto);
   /* Without an explicit width (the "Auto" default), this flex item would otherwise grow to the
      table's own natural content width — fine on a wide TV, but on a narrow phone that's wider
      than the screen, and since the page never scrolls (overflow: hidden, see html/body above)
@@ -1477,11 +1499,19 @@ body.fs-portrait [data-breakpoint="mobile"] { display: block; }
   }
   /* Desktop offsets are ignored on phones so text never gets pushed off-screen. */
   .slide__content { transform: none; }
-  /* Same for the shared table's own nudge: dragged on a wide TV/desktop preview, that raw px
-     offset would otherwise carry over unchanged onto a much narrower phone and push the table
-     partly or fully off-screen. Its h/v alignment still positions it — only the extra nudge
-     on top of that is dropped. */
-  .slide__table-pos { transform: none; }
+  /* The table's own position/size below this width comes from its own Phone row in Table
+     Settings (the -mobile custom properties) rather than the TV ones above — defaults to the
+     same spot/size as TV until the admin sets a phone-specific value there, same as
+     mobileFocalPoint falls back to focalPoint for the background image. */
+  .slide__table-layout {
+    justify-content: var(--table-h-align-mobile, var(--table-h-align, center));
+    align-items: var(--table-v-align-mobile, var(--table-v-align, center));
+  }
+  .slide__table-pos {
+    transform: translate(var(--table-offset-x-mobile, 0px), var(--table-offset-y-mobile, 0px));
+    width: var(--table-width-mobile, auto);
+    height: var(--table-height-mobile, auto);
+  }
   /* Side gradients don't cover stacked mobile text — switch to a bottom-up wash. */
   .slide__overlay--left,
   .slide__overlay--right {
@@ -1607,6 +1637,8 @@ setInterval(function () {
 <?php if ($s['table']): $tbl = $s['table'];
     $bgRgb = implode(',', array_map('hexdec', str_split(ltrim($tbl['bgColor'], '#'), 2)));
     $headerRgb = implode(',', array_map('hexdec', str_split(ltrim($tbl['headerColor'], '#'), 2)));
+    $flexH = ['left' => 'flex-start', 'center' => 'center', 'right' => 'flex-end'];
+    $flexV = ['top' => 'flex-start', 'center' => 'center', 'bottom' => 'flex-end'];
     $tblStyle = '--table-font-size:' . $tbl['fontSize'] . 'px;'
         . '--table-header-font-size:' . $tbl['headerFontSize'] . 'px;'
         . '--table-text-color:' . $tbl['textColor'] . ';'
@@ -1621,19 +1653,32 @@ setInterval(function () {
         . '--table-bg-color:' . $bgRgb . ';'
         . '--table-bg-opacity:' . $tbl['bgOpacity'] . ';'
         . '--table-radius:' . ($tbl['rounded'] ? '14px' : '0px') . ';'
+        // Position/size as CSS custom properties (not plain `transform`/`width`/`height`
+        // declarations) so the @media rule further up can swap in the -mobile variant below a
+        // given screen width — an inline style="" attribute can't itself contain a @media block,
+        // so the breakpoint-awareness has to live in the stylesheet, reading whichever of these
+        // two values that rule picks.
+        . '--table-h-align:' . $flexH[$tbl['hAlign']] . ';'
+        . '--table-v-align:' . $flexV[$tbl['vAlign']] . ';'
         . '--table-offset-x:' . $tbl['offsetX'] . ';'
         . '--table-offset-y:' . $tbl['offsetY'] . ';'
-        . ($tbl['width'] > 0 ? 'width:' . $tbl['width'] . '%;' : '')
-        . ($tbl['height'] > 0 ? 'height:' . $tbl['height'] . '%;' : '');
+        . '--table-width:' . ($tbl['width'] > 0 ? $tbl['width'] . '%' : 'auto') . ';'
+        . '--table-height:' . ($tbl['height'] > 0 ? $tbl['height'] . '%' : 'auto') . ';'
+        . '--table-h-align-mobile:' . $flexH[$tbl['mobileHAlign']] . ';'
+        . '--table-v-align-mobile:' . $flexV[$tbl['mobileVAlign']] . ';'
+        . '--table-offset-x-mobile:' . $tbl['mobileOffsetX'] . ';'
+        . '--table-offset-y-mobile:' . $tbl['mobileOffsetY'] . ';'
+        . '--table-width-mobile:' . ($tbl['mobileWidth'] > 0 ? $tbl['mobileWidth'] . '%' : 'auto') . ';'
+        . '--table-height-mobile:' . ($tbl['mobileHeight'] > 0 ? $tbl['mobileHeight'] . '%' : 'auto') . ';';
 ?>
 <?php if ($tbl['rows']): ?>
-      <div class="slide__table-layout v-<?= e($tbl['vAlign']) ?> h-<?= e($tbl['hAlign']) ?>">
-        <div class="slide__table-pos" style="<?= e($tblStyle) ?>">
+      <div class="slide__table-layout" style="<?= e($tblStyle) ?>">
+        <div class="slide__table-pos">
 <?php if ($tbl['title'] !== ''): ?>
           <div class="slide__table-banner"><span>&#10022;</span><?= e($tbl['title']) ?><span>&#10022;</span></div>
 <?php endif; ?>
           <div class="slide__table-wrap">
-            <table class="slide__table<?= $tbl['width'] > 0 ? ' slide__table--sized' : '' ?>">
+            <table class="slide__table<?= ($tbl['width'] > 0 || $tbl['mobileWidth'] > 0) ? ' slide__table--sized' : '' ?>">
 <?php foreach ($tbl['rows'] as $ri => $row):
     $isHead = $ri === 0 && $tbl['headerRow'];
     $tag = $isHead ? 'th' : 'td';
